@@ -39,6 +39,8 @@ class LitVAE(pl.LightningModule):
         weight_decay: float = 0.1,
         gene_loss_coeff: float = 5e-4,
         save_gene_vals: bool = True,
+        library_mean: Optional[float] = None,
+        library_var: Optional[float] = None,
 
     ):
         super().__init__()
@@ -55,6 +57,8 @@ class LitVAE(pl.LightningModule):
         self.weight_decay = weight_decay
         self.gene_loss_coeff = gene_loss_coeff
         self.save_gene_vals = save_gene_vals
+        self.library_mean = library_mean
+        self.library_var = library_var
 
         print(f"Learning rate: {self.learning_rate}")
         print(f"Weight decay: {self.weight_decay}")
@@ -179,9 +183,23 @@ class LitVAE(pl.LightningModule):
 
         return kl_weight
 
+    def library_stats(self, gene_vals):
+
+        if self.library_mean is None or self.library_var is None:
+            library_size_per_cell = torch.log(gene_vals.sum(dim=1))
+            local_l_mean = library_size_per_cell.mean()
+            local_v_mean = library_size_per_cell.var()
+            local_v_mean = torch.clip(local_v_mean, 0.1, 1e3)
+        else:
+            local_l_mean = torch.from_numpy(np.array(self.library_mean))
+            local_v_mean = torch.from_numpy(np.array(self.library_var))
+
+        return local_l_mean, local_v_mean
+
     def validation_step(self, batch, batch_idx):
 
         gene_vals, cell_targets, cell_mask, batch_labels, batch_mask = batch
+        print("DDD", gene_vals.size(), cell_targets.size())
         qz_m, qz_v, z = self.network.z_encoder(gene_vals, batch_labels, batch_mask)
         ql_m, ql_v, library = self.network.l_encoder(gene_vals, batch_labels, batch_mask)
         px_scale, _, px_rate, px_dropout = self.network.decoder(self.dispersion, z, library, batch_labels, batch_mask)
@@ -189,10 +207,7 @@ class LitVAE(pl.LightningModule):
         px_r = self.network.px_r
         px_r = torch.exp(px_r)
 
-        library_size_per_cell = torch.log(gene_vals.sum(dim=1))
-        local_l_mean = library_size_per_cell.mean()
-        local_v_mean = library_size_per_cell.var()
-        local_v_mean = torch.clip(local_v_mean, 0.1, 999.0)
+        local_l_mean, local_v_mean = self.library_stats(gene_vals)
 
         gene_loss, kl_z = self.gene_loss(
             gene_vals,
@@ -220,30 +235,19 @@ class LitVAE(pl.LightningModule):
             for n, k in enumerate(self.batch_properties.keys()):
                 self.results[k].append(batch_labels[:, n].detach().cpu().numpy())
 
-    def on_train_epoch_end(self):
-
-
-        if self.current_epoch == 9:
-            pass
-            """
-            for n, p in self.network.named_parameters():
-                if "cell_decoder" in n or "encoder" in n:
-                    p.requires_grad = False
-            """
-
     def on_validation_epoch_end(self):
 
         v = self.trainer.logger.version
         fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results.pkl"
         for k in self.cell_properties.keys():
-            self.results[k] = np.stack(self.results[k])
-            self.results["pred_" + k] = np.stack(self.results["pred_" + k])
+            self.results[k] = np.concatenate(self.results[k], axis=0)
+            self.results["pred_" + k] = np.concatenate(self.results["pred_" + k], axis=0)
         if self.batch_properties is not None:
             for k in self.batch_properties.keys():
-                self.results[k] = np.stack(self.results[k])
+                self.results[k] = np.concatenate(self.results[k], axis=0)
         if self.save_gene_vals:
-            self.results["gene_vals"] = np.stack(self.results["gene_vals"])
-        self.results["cell_mask"] = np.stack(self.results["cell_mask"])
+            self.results["gene_vals"] = np.concatenate(self.results["gene_vals"], axis=0)
+        self.results["cell_mask"] = np.concatenate(self.results["cell_mask"], axis=0)
 
         pickle.dump(self.results, open(fn, "wb"))
 
@@ -266,7 +270,7 @@ class LitVAE(pl.LightningModule):
                 pred_idx = torch.argmax(cell_pred[k], dim=-1).to(torch.int64)
                 pred_prop = cell_pred[k][:, -1].to(torch.float32).detach().cpu().numpy()
                 targets = cell_targets[:, n].to(torch.int64)
-                self.cell_accuracy[k].update(pred_idx[idx], targets[idx])
+                self.cell_accuracy[k].update(pred_idx[idx][None, :], targets[idx][None, :])
                 self.results[k].append(targets.detach().cpu().numpy())
                 self.results["pred_" + k].append(sigmoid(pred_prop))
             else:
@@ -331,10 +335,7 @@ class LitVAE(pl.LightningModule):
             px_r = self.network.px_r
         px_r = torch.exp(px_r)
 
-        library_size_per_cell = torch.log(gene_vals.sum(dim=1))
-        local_l_mean = library_size_per_cell.mean()
-        local_v_mean = library_size_per_cell.var()
-        local_v_mean = torch.clip(local_v_mean, 0.1, 999.0)
+        local_l_mean, local_v_mean = self.library_stats(gene_vals)
 
         # Loss
         gene_loss, kl_z = self.gene_loss(gene_vals, qz_m, qz_v, ql_m, ql_v, local_l_mean, local_v_mean, px_rate, px_r, px_dropout)

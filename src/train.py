@@ -23,11 +23,13 @@ def main():
     #fn = "/home/masse/work/vae/lightning_logs/version_164/checkpoints/epoch=77-step=156000.ckpt"
     #network = load_model(fn, network)
 
-
+    task_cfg["library_mean"], task_cfg["library_var"] = dm.train_dataset.library_size_stats()
     task = LitVAE(
         network=network,
         **task_cfg,
     )
+
+
 
     trainer = pl.Trainer(
         enable_checkpointing=True,

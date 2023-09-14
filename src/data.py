@@ -24,8 +24,6 @@ class SingleCellDataset(Dataset):
         batch_size: int = 64,
         max_cell_prop_val: float = 999,
         protein_coding_only: bool = False,
-        bin_gene_count: bool = False,
-        n_gene_bins: int = 16,
         restrictions: Optional[Dict[str, Any]] = {"class": "OPC"},
         max_gene_val: Optional[float] = 6.0,
         training: bool = True,
@@ -47,13 +45,12 @@ class SingleCellDataset(Dataset):
         self.n_cell_properties = len(cell_properties) if cell_properties is not None else 0
         self.batch_size = batch_size
 
-        self.bin_gene_count = bin_gene_count
-        self.n_gene_bins = n_gene_bins
         self.max_cell_prop_val = max_cell_prop_val
         self.protein_coding_only = protein_coding_only
         self.max_gene_val = max_gene_val
         self.training = training
 
+        # offset is needed for memmap loading
         self.offset = 1 * self.n_genes_original  # UINT8 is 1 bytes
 
         # possibly use for embedding the gene inputs
@@ -69,6 +66,21 @@ class SingleCellDataset(Dataset):
 
     def __len__(self):
         return self.n_samples
+
+    def library_size_stats(self):
+
+        N = 200_000
+        counts = []
+        idx = self.cell_idx[:N] if len(self.cell_idx) > N else self.cell_idx
+
+        for n in idx:
+            data = np.memmap(
+                self.data_path, dtype='uint8', mode='r', shape=(self.n_genes_original,), offset=n * self.offset
+            )[self.gene_idx].astype(np.float32)
+            counts.append(np.log(np.sum(data, axis=-1)))
+
+        return np.mean(counts), np.var(counts)
+
 
     def _restrict_samples(self, restrictions):
 
@@ -189,10 +201,9 @@ class SingleCellDataset(Dataset):
             return self.labels[batch_idx], self.mask[batch_idx], None, None
 
 
-
     def _get_gene_vals_batch(self, batch_idx: List[int]):
 
-        gene_vals = np.zeros((self.batch_size, self.n_genes), dtype=np.float32)
+        gene_vals = np.zeros((len(batch_idx), self.n_genes), dtype=np.float32)
         for n, i in enumerate(batch_idx):
 
             j = i if self.cell_idx is None else self.cell_idx[i]
@@ -202,39 +213,7 @@ class SingleCellDataset(Dataset):
 
         return gene_vals
 
-    def _bin_gene_count(self, x: np.ndarray) -> np.ndarray:
-        # NOT CURRENTLY USED
-        return np.digitize(x, self.bins)
-
-    def _normalize(self, x: np.ndarray) -> np.ndarray:
-        # NOT CURRENTLY USED
-        x = x * self.normalize_total / np.sum(x) if self.normalize_total is not None else x
-        x = np.log1p(x) if self.log_normalize else x
-        x = np.minimum(x, self.max_gene_val) if self.max_gene_val is not None else x
-        return x
-
     def _prepare_data(self, batch_idx):
-
-
-        #############################
-        if self.training:
-            pass
-            #b = self.batch_labels[batch_idx[0]]
-            #idx = np.where((b[0] == self.batch_labels[:, 0]) * (b[1] == self.batch_labels[:, 1]))[0]
-            #N = len(idx)
-            #replace = False if N >= self.batch_size else True
-            #batch_idx = np.random.choice(idx, size=self.batch_size, replace=replace)
-
-
-            #subject = np.random.choice(self.unique_subjects)
-            #idx = np.where(self.subjects == subject)[0]
-            #N = len(idx)
-            #replace = False if N >= self.batch_size else True
-            #batch_idx = np.random.choice(idx, size=self.batch_size, replace=replace)
-
-        ############################
-
-
 
         # get input and target data, returned as numpy arrays
         gene_vals = self._get_gene_vals_batch(batch_idx)
@@ -247,9 +226,6 @@ class SingleCellDataset(Dataset):
 
         if isinstance(batch_idx, int):
             batch_idx = [batch_idx]
-
-        if len(batch_idx) != self.batch_size:
-            raise ValueError("Index length not equal to batch_size")
 
         gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask = self._prepare_data(batch_idx)
 
@@ -274,7 +250,7 @@ class DataModule(pl.LightningDataModule):
         num_workers: int = 16,
         cell_properties: Optional[Dict[str, Any]] = None,
         batch_properties: Optional[Dict[str, Any]] = None,
-        bin_gene_count: bool = False,
+        protein_coding_only: bool = False,
     ):
         super().__init__()
         self.train_data_path = train_data_path
@@ -285,7 +261,7 @@ class DataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.cell_properties = cell_properties
         self.batch_properties = batch_properties
-        self.bin_gene_count = bin_gene_count
+        self.protein_coding_only = protein_coding_only
         self._get_cell_prop_info()
         self._get_batch_prop_info()
 
@@ -379,7 +355,7 @@ class DataModule(pl.LightningDataModule):
             cell_properties=self.cell_properties,
             batch_properties=self.batch_properties,
             batch_size=self.batch_size,
-            bin_gene_count=self.bin_gene_count,
+            protein_coding_only=self.protein_coding_only,
             training=True,
         )
         self.val_dataset = SingleCellDataset(
@@ -388,7 +364,7 @@ class DataModule(pl.LightningDataModule):
             cell_properties=self.cell_properties,
             batch_properties=self.batch_properties,
             batch_size=self.batch_size,
-            bin_gene_count=self.bin_gene_count,
+            protein_coding_only=self.protein_coding_only,
             training=False,
         )
 
@@ -414,9 +390,9 @@ class DataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         sampler = BatchSampler(
-            RandomSampler(self.val_dataset),
+            SequentialSampler(self.val_dataset),
             batch_size=self.val_dataset.batch_size,
-            drop_last=True,
+            drop_last=False,
         )
         dl = DataLoader(
             self.val_dataset,
