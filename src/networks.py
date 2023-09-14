@@ -61,6 +61,7 @@ class VAE(nn.Module):
         n_latent_cell_decoder: int = 10,
         n_layers: int = 1,
         dropout_rate: float = 0.1,
+        input_dropout_rate: float = 0.0,
         cell_properties: Optional[Dict[str, Any]] = None,
         batch_properties: Optional[Dict[str, Any]] = None,
         dispersion: str = "gene",
@@ -104,6 +105,7 @@ class VAE(nn.Module):
             n_layers=n_layers,
             n_hidden=n_hidden,
             dropout_rate=dropout_rate,
+            input_dropout_rate=input_dropout_rate,
             distribution=latent_distribution,
         )
         # l encoder goes from n_input-dimensional data to 1-d library size
