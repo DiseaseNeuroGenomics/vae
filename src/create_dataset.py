@@ -110,13 +110,14 @@ class CreateData:
 
         data_fn = os.path.join(self.target_path, "data.dat")
         n_genes = len(self.gene_idx)
-        print(f"Creating data. Number of cell: {len(idx)}, number of genes: {n_genes}")
+        n_cells = len(self.cell_idx)
+        print(f"Creating data. Number of cell: {n_cells}, number of genes: {n_genes}")
 
         chunk_size = 10_000  # chunk size for loading data into memory
-        fp = np.memmap(data_fn, dtype='uint8', mode='w+', shape=(len(idx), n_genes))
+        fp = np.memmap(data_fn, dtype='uint8', mode='w+', shape=(n_cells, n_genes))
 
-        for n in range(int(np.ceil(len(self.cell_idx) / chunk_size))):
-            m = np.minimum(len(self.cell_idx), (n + 1) * chunk_size)
+        for n in range(int(n_cells / chunk_size)):
+            m = np.minimum(n_cells, (n + 1) * chunk_size)
             current_idx = self.cell_idx[n * chunk_size: m]
             print(f"Creating dataset, cell number = {current_idx[0]}")
             y = self.anndata[current_idx]
@@ -151,6 +152,9 @@ if __name__ == "__main__":
         base_dir + "MSSM_2023-06-08_22_31.h5ad",
     ]
     target_path = "/sc/arion/projects/psychAD/massen06/mssm_rush_data_0914"
+
+    if not os.path.isdir(target_path):
+        os.mkdir(target_path)
 
     c = CreateData(source_paths, target_path)
 
