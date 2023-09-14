@@ -25,9 +25,6 @@ class FCLayers(nn.Module):
 
     :param n_in: The dimensionality of the input
     :param n_out: The dimensionality of the output
-    :param n_cat_list: A list containing, for each category of interest,
-                 the number of categories. Each category will be
-                 included using a one-hot encoding.
     :param n_layers: The number of fully-connected hidden layers
     :param n_hidden: The number of nodes per hidden layer
     :param dropout_rate: Dropout rate to apply to each of the hidden layers
@@ -54,8 +51,7 @@ class FCLayers(nn.Module):
         self.batch_dims = 0 if batch_properties is None else [
             len(batch_properties[k]["values"]) for k in batch_properties.keys()
         ]
-        print("NNN", n_layers)
-        # self.act = nn.ReLU()
+
         self.act = nn.GELU()
         n = n_hidden if n_layers > 1 else n_hidden - np.sum(self.batch_dims)
         self.ff0 = nn.Linear(n_in, n)
@@ -67,9 +63,7 @@ class FCLayers(nn.Module):
         layers = []
         for n in range(n_layers - 1):
             layers.append(nn.Linear(layers_dim[n], layers_dim[n + 1]))
-            # layers.append(nn.ReLU())
             layers.append(nn.GELU())
-            # layers.append(nn.BatchNorm1d(n_hidden, eps=0.01, momentum=0.01))
             layers.append(nn.LayerNorm(n_hidden, elementwise_affine=False))
             layers.append(nn.Dropout(p=float(dropout_rate)))
 
@@ -101,9 +95,6 @@ class Encoder(nn.Module):
 
     :param n_input: The dimensionality of the input (data space)
     :param n_output: The dimensionality of the output (latent space)
-    :param n_cat_list: A list containing the number of categories
-                       for each category of interest. Each category will be
-                       included using a one-hot encoding
     :param n_layers: The number of fully-connected hidden layers
     :param n_hidden: The number of nodes per hidden layer
     :dropout_rate: Dropout rate to apply to each of the hidden layers
@@ -118,6 +109,7 @@ class Encoder(nn.Module):
         n_layers: int = 1,
         n_hidden: int = 128,
         dropout_rate: float = 0.1,
+        input_dropout_rate: float = 0.0,
         distribution: str = "normal",
     ):
         super().__init__()
@@ -139,11 +131,8 @@ class Encoder(nn.Module):
         else:
             self.z_transformation = identity
 
-        drop_p = 0.5
-        self.drop = nn.Dropout(p=drop_p)
+        self.drop = nn.Dropout(p=input_dropout_rate)
         self.softplus = nn.Softplus()
-        # self.bn = nn.BatchNorm1d(n_input, eps=0.01, momentum=0.001, affine=False)
-        print(f"encoder drop: {drop_p}")
 
     def forward(self, x: torch.Tensor, batch_labels: torch.Tensor, batch_mask: torch.Tensor):
         r"""The forward computation for a single sample.
