@@ -71,7 +71,7 @@ class CreateData:
             "obs": {k: self.anndata.obs[k][self.cell_idx].values for k in self.obs_keys},
             "var": {k: self.anndata.var[k][self.gene_idx].values for k in self.var_keys},
         }
-        meta["obs"]["barcode"] = list(self.anndata.obs.index)[self.cell_idx]
+        meta["obs"]["barcode"] = list(np.array(self.anndata.obs.index))[self.cell_idx]
 
         meatadata_fn = os.path.join(self.target_path, "metadata.pkl")
         pickle.dump(meta, open(meatadata_fn, "wb"))
@@ -136,12 +136,11 @@ class CreateData:
 
     def create_datasets(self) -> None:
 
+        print("Saving the metadata...")
+        self._create_metadata()
 
         print("Saving the expression data in the memmap array...")
         fp = self._create_dataset()
-
-        print("Saving the metadata...")
-        self._create_metadata()
 
 
 if __name__ == "__main__":
