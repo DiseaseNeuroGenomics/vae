@@ -19,6 +19,7 @@ class SingleCellDataset(Dataset):
         self,
         data_path: str,
         metadata_path: str,
+        cell_idx: List[int],
         cell_properties: Optional[Dict[str, Any]] = None,
         batch_properties: Optional[Dict[str, Any]] = None,
         batch_size: int = 64,
@@ -31,9 +32,10 @@ class SingleCellDataset(Dataset):
 
         self.metadata = pickle.load(open(metadata_path, "rb"))
         self.data_path = data_path
+        self.cell_idx = cell_idx
+        self.n_samples = len(cell_idx)
         self.cell_properties = cell_properties
         self.batch_properties = batch_properties
-        self.n_samples = len(self.metadata["obs"]["class"])
 
         self._restrict_samples(restrictions)
 
@@ -84,44 +86,27 @@ class SingleCellDataset(Dataset):
 
     def _restrict_samples(self, restrictions):
 
-        if restrictions is None:
-            cond = 1
-            #cond *= self.metadata["obs"]["ALS"] <= 0
-            #cond *= self.metadata["obs"]["SCZ"] <= 0
+        if restrictions is not None:
+            N = len(self.metadata["obs"]["class"])
+            cond = np.array([n in self.cell_idx for n in range(N)])
 
-            cond *= self.metadata["obs"]["ALS"] <= 99999
-            cond *= self.metadata["obs"]["SCZ"] <= 99999
-
-            self.cell_idx = np.where(cond)[0]
-            self.n_samples = len(self.cell_idx)
-            for k in self.metadata["obs"].keys():
-                self.metadata["obs"][k] = self.metadata["obs"][k][self.cell_idx]
-            print(f"Restricting samples. New number of samples: {self.n_samples}")
-        else:
-            cond = 1
             for k, v in restrictions.items():
                 cond *= self.metadata["obs"][k] == v
 
-            # remove ALS, SCZ
-            cond *= self.metadata["obs"]["ALS"] <= 999
-            cond *= self.metadata["obs"]["SCZ"] <= 999
-
             self.cell_idx = np.where(cond)[0]
             self.n_samples = len(self.cell_idx)
-            for k in self.metadata["obs"].keys():
-                self.metadata["obs"][k] = self.metadata["obs"][k][self.cell_idx]
-            print(f"Restricting samples. New number of samples: {self.n_samples}")
+
+        for k in self.metadata["obs"].keys():
+            self.metadata["obs"][k] = self.metadata["obs"][k][self.cell_idx]
+        print(f"Restricting samples; number of samples: {self.n_samples}")
 
     def _get_gene_index(self):
-
-        # genes = pickle.load(open("/home/masse/work/mssm/living_brain/data/syn_lyso_genes", "rb"))
 
         if self.protein_coding_only:
             self.gene_idx = np.where(self.metadata["var"]['protein_coding'])[0]
         else:
             self.gene_idx = np.arange(self.n_genes_original)
 
-        #self.gene_idx = [n for n, v in enumerate(self.metadata["var"]['gene_name']) if v in genes]
         self.n_genes = len(self.gene_idx)
         print(f"Sub-sampling genes. Number of genes is now {self.n_genes}")
 
@@ -141,7 +126,7 @@ class SingleCellDataset(Dataset):
                 idx = np.where(cell_val == np.array(prop["values"]))[0]
                 # cell property values of -1 will imply N/A, and will be masked out
                 if len(idx) == 0:
-                    self.batch_labels[n0, n1] = np.nan
+                    self.batch_labels[n0, n1] = 0.0
                     self.batch_mask[n0, n1] = 0
                 else:
                     self.batch_labels[n0, n1] = idx[0]
@@ -163,7 +148,6 @@ class SingleCellDataset(Dataset):
             self.cell_class[n0] = idx[0]
 
             for n1, (k, cell_prop) in enumerate(self.cell_properties.items()):
-                #print("AAA", k, np.unique(self.metadata["obs"][k]))
                 cell_val = self.metadata["obs"][k][n0]
                 if not cell_prop["discrete"]:
                     # continuous value
@@ -205,8 +189,7 @@ class SingleCellDataset(Dataset):
 
         gene_vals = np.zeros((len(batch_idx), self.n_genes), dtype=np.float32)
         for n, i in enumerate(batch_idx):
-
-            j = i if self.cell_idx is None else self.cell_idx[i]
+            j = self.cell_idx[i]
             gene_vals[n, :] = np.memmap(
                 self.data_path, dtype='uint8', mode='r', shape=(self.n_genes_original,), offset=j * self.offset
             )[self.gene_idx].astype(np.float32)
@@ -242,10 +225,10 @@ class DataModule(pl.LightningDataModule):
 
     def __init__(
         self,
-        train_data_path: str,
-        train_metadata_path: str,
-        test_data_path: str,
-        test_metadata_path: str,
+        data_path: str,
+        metadata_path: str,
+        train_idx: List[int],
+        test_idx: List[int],
         batch_size: int = 32,
         num_workers: int = 16,
         cell_properties: Optional[Dict[str, Any]] = None,
@@ -253,10 +236,10 @@ class DataModule(pl.LightningDataModule):
         protein_coding_only: bool = False,
     ):
         super().__init__()
-        self.train_data_path = train_data_path
-        self.train_metadata_path = train_metadata_path
-        self.test_data_path = test_data_path
-        self.test_metadata_path = test_metadata_path
+        self.data_path = data_path
+        self.metadata_path = metadata_path
+        self.train_idx = train_idx
+        self.test_idx = test_idx
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.cell_properties = cell_properties
@@ -267,7 +250,7 @@ class DataModule(pl.LightningDataModule):
 
     def _get_batch_prop_info(self):
 
-        metadata = pickle.load(open(self.train_metadata_path, "rb"))
+        metadata = pickle.load(open(self.metadata_path, "rb"))
 
         if self.batch_properties is None:
             pass
@@ -292,7 +275,7 @@ class DataModule(pl.LightningDataModule):
 
         self.n_cell_properties = len(self.cell_properties) if self.cell_properties is not None else 0
 
-        metadata = pickle.load(open(self.train_metadata_path, "rb"))
+        metadata = pickle.load(open(self.metadata_path, "rb"))
 
         # not a great place for this, but needed
         self.n_genes = len(metadata["var"]["gene_name"])
@@ -312,16 +295,15 @@ class DataModule(pl.LightningDataModule):
                     # remove nans, negative values, or anything else suspicious
                     if k in ["CERAD", "BRAAK_AD"]:
                         unique_list = np.unique(cell_vals)
-                        print("XYYXX", k, unique_list)
                         unique_list = unique_list[unique_list > -999]
                         self.cell_properties[k]["mean"] = np.mean(unique_list)
                         self.cell_properties[k]["std"] = np.std(unique_list)
-                        print("CELL PROP INFO", k, self.cell_properties[k]["mean"], self.cell_properties[k]["std"])
+                        print(f"Property: {k}, mean: {self.cell_properties[k]['mean']}, std: {self.cell_properties[k]['std']}")
                     else:
                         idx = [n for n, cv in enumerate(cell_vals) if cv >= 0 and cv < max_cell_prop_val]
                         self.cell_properties[k]["mean"] = np.mean(cell_vals[idx])
                         self.cell_properties[k]["std"] = np.std(cell_vals[idx])
-                        print("CELL PROP INFO", k, self.cell_properties[k]["mean"], self.cell_properties[k]["std"])
+                        print(f"Property: {k}, mean: {self.cell_properties[k]['mean']}, std: {self.cell_properties[k]['std']}")
 
                 elif cell_prop["discrete"] and cell_prop["values"] is None:
                     # for cell properties with discrete value, determine the possible values if none were supplied
@@ -335,13 +317,13 @@ class DataModule(pl.LightningDataModule):
                     ]
                     self.cell_properties[k]["values"] = unique_list[idx]
                     self.cell_properties[k]["freq"] = counts[idx] / np.mean(counts[idx])
-                    print("CELL PROP INFO",k, self.cell_properties[k]["freq"])
+                    print(f"Property: {k}, values: {self.cell_properties[k]['values']}")
 
                 elif cell_prop["discrete"] and cell_prop["values"] is not None:
                     unique_list, counts = np.unique(cell_vals, return_counts=True)
                     idx = [n for n, u in enumerate(unique_list) if u in cell_prop["values"]]
                     self.cell_properties[k]["freq"] = counts[idx] / np.mean(counts[idx])
-                    print("CELL PROP INFO", k, self.cell_properties[k]["freq"])
+                    print(f"Property: {k}, values: {self.cell_properties[k]['values']}")
 
         else:
             self.cell_prop_dist = None
@@ -350,8 +332,9 @@ class DataModule(pl.LightningDataModule):
     def setup(self, stage):
 
         self.train_dataset = SingleCellDataset(
-            self.train_data_path,
-            self.train_metadata_path,
+            self.data_path,
+            self.metadata_path,
+            self.train_idx,
             cell_properties=self.cell_properties,
             batch_properties=self.batch_properties,
             batch_size=self.batch_size,
@@ -359,8 +342,9 @@ class DataModule(pl.LightningDataModule):
             training=True,
         )
         self.val_dataset = SingleCellDataset(
-            self.test_data_path,
-            self.test_metadata_path,
+            self.data_path,
+            self.metadata_path,
+            self.test_idx,
             cell_properties=self.cell_properties,
             batch_properties=self.batch_properties,
             batch_size=self.batch_size,

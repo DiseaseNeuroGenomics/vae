@@ -12,7 +12,7 @@ cell_properties = {
     "Age": {"discrete": False, "values": [-1], "stop_grad": True},
     "PMI": {"discrete": False, "values": [-1],  "stop_grad": True},
     "SCZ": {"discrete": True, "values": [0, 1],  "stop_grad": True},
-    "SubID": {"discrete": True, "values": None,  "stop_grad": True},
+    #"SubID": {"discrete": True, "values": None,  "stop_grad": True},
 }
 
 """
@@ -26,15 +26,13 @@ batch_properties = {
 batch_properties = None
 
 dataset_cfg = {
-    "train_data_path": "/home/masse/work/perceiver/mssm_rush_data_all_genes/train_data.dat",
-    "train_metadata_path": "/home/masse/work/perceiver/mssm_rush_data_all_genes/train_metadata.pkl",
-    "test_data_path": "/home/masse/work/perceiver/mssm_rush_data_all_genes/test_data.dat",
-    "test_metadata_path": "/home/masse/work/perceiver/mssm_rush_data_all_genes/test_metadata.pkl",
+    "data_path": "/home/masse/work/data/mssm_rush/data.dat",
+    "metadata_path": "/home/masse/work/data/mssm_rush/metadata.pkl",
     "cell_properties": cell_properties,
     "batch_size": 1024,
     "num_workers": 8,
-    "bin_gene_count": False,
     "batch_properties": batch_properties,
+    "protein_coding_only": False,
 }
 
 model_cfg = {
@@ -43,17 +41,20 @@ model_cfg = {
     "n_hidden_decoder": 64,
     "n_hidden_library": 64,
     "n_latent": 32,
-    "n_latent_cell_decoder": 32,
+    "n_latent_cell_decoder": 16,
     "dropout_rate": 0.5,
+    "input_dropout_rate": 0.5,
+
 }
 
 task_cfg = {
     "learning_rate": 1e-4,
     "weight_decay": 0.0,
-    "gene_loss_coeff": 5e-4,
+    "gene_loss_coeff": 1e-3,
     "balance_classes": True,
     "n_epochs_kl_warmup": 1,
     "batch_properties": batch_properties,
+    "save_gene_vals": False,
 }
 
 trainer_cfg = {
