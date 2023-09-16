@@ -25,8 +25,9 @@ class SingleCellDataset(Dataset):
         batch_size: int = 64,
         max_cell_prop_val: float = 999,
         protein_coding_only: bool = False,
-        restrictions: Optional[Dict[str, Any]] = {"class": "OPC"},
+        cell_restrictions: Optional[Dict[str, Any]] = {"class": "OPC"},
         max_gene_val: Optional[float] = 6.0,
+        gene_idx: Optional[List[int]] = None,
         training: bool = True,
     ):
 
@@ -37,13 +38,14 @@ class SingleCellDataset(Dataset):
         self.cell_properties = cell_properties
         self.batch_properties = batch_properties
 
-        self._restrict_samples(restrictions)
+        self._restrict_samples(cell_restrictions)
 
         print(f"Number of cells {self.n_samples}")
         if "gene_name" in self.metadata["var"].keys():
             self.n_genes_original = len(self.metadata["var"]["gene_name"])
         else:
             self.n_genes_original = len(self.metadata["var"])
+
         self.n_cell_properties = len(cell_properties) if cell_properties is not None else 0
         self.batch_size = batch_size
 
@@ -59,15 +61,32 @@ class SingleCellDataset(Dataset):
         self.cell_classes = np.array(['Astro', 'EN', 'Endo', 'IN', 'Immune', 'Mural', 'OPC', 'Oligo'])
 
         # this will down-sample the number if genes if specified
-        # for now, need to call this AFTER calculating offset
-        # self.ad_genes = pickle.load(open("/home/masse/work/perceiver/AD_protein.pkl","rb"))
-        self._get_gene_index()
+        if gene_idx is None:
+            self._gene_stats()
+            self._get_gene_index()
+        else:
+            self.gene_idx = gene_idx
+            self.n_genes = len(self.gene_idx )
         self._get_cell_prop_vals()
         self._get_batch_prop_vals()
         # self.bins = [0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 11, 13, 16, 22, 35, 55, 9999]
 
     def __len__(self):
         return self.n_samples
+
+    def _gene_stats(self):
+
+        N = 200_000
+        counts = np.zeros(self.n_genes_original, dtype=np.float32)
+        idx = self.cell_idx[:N] if len(self.cell_idx) > N else self.cell_idx
+
+        for n in idx:
+            data = np.memmap(
+                self.data_path, dtype='uint8', mode='r', shape=(self.n_genes_original,), offset=n * self.offset
+            )
+            counts += np.clip(data, 0, 1)
+
+        self.metadata["var"]["percent_cells"] = 100 * counts / len(idx)
 
     def library_size_stats(self):
 
@@ -87,8 +106,8 @@ class SingleCellDataset(Dataset):
     def _restrict_samples(self, restrictions):
 
         if restrictions is not None:
-            N = len(self.metadata["obs"]["class"])
-            cond = np.array([n in self.cell_idx for n in range(N)])
+            cond = np.zeros(len(self.metadata["obs"]["class"]), dtype=np.uint8)
+            cond[self.cell_idx] = 1
 
             for k, v in restrictions.items():
                 cond *= self.metadata["obs"][k] == v
@@ -97,13 +116,16 @@ class SingleCellDataset(Dataset):
             self.n_samples = len(self.cell_idx)
 
         for k in self.metadata["obs"].keys():
-            self.metadata["obs"][k] = self.metadata["obs"][k][self.cell_idx]
+            self.metadata["obs"][k] = np.array(self.metadata["obs"][k])[self.cell_idx]
         print(f"Restricting samples; number of samples: {self.n_samples}")
 
     def _get_gene_index(self):
 
         if self.protein_coding_only:
-            self.gene_idx = np.where(self.metadata["var"]['protein_coding'])[0]
+            cond = 1
+            cond *= self.metadata["var"]['percent_cells'] >= 2.0
+            # cond *= self.metadata["var"]['protein_coding']
+            self.gene_idx = np.where(cond)[0]
         else:
             self.gene_idx = np.arange(self.n_genes_original)
 
@@ -211,8 +233,9 @@ class SingleCellDataset(Dataset):
             batch_idx = [batch_idx]
 
         gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask = self._prepare_data(batch_idx)
+        cell_idx = self.cell_idx[batch_idx]
 
-        return (gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask)
+        return (gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, cell_idx)
 
 
 class DataModule(pl.LightningDataModule):
@@ -234,6 +257,7 @@ class DataModule(pl.LightningDataModule):
         cell_properties: Optional[Dict[str, Any]] = None,
         batch_properties: Optional[Dict[str, Any]] = None,
         protein_coding_only: bool = False,
+        cell_restrictions: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.data_path = data_path
@@ -245,6 +269,7 @@ class DataModule(pl.LightningDataModule):
         self.cell_properties = cell_properties
         self.batch_properties = batch_properties
         self.protein_coding_only = protein_coding_only
+        self.cell_restrictions = cell_restrictions
         self._get_cell_prop_info()
         self._get_batch_prop_info()
 
@@ -339,6 +364,7 @@ class DataModule(pl.LightningDataModule):
             batch_properties=self.batch_properties,
             batch_size=self.batch_size,
             protein_coding_only=self.protein_coding_only,
+            cell_restrictions=self.cell_restrictions,
             training=True,
         )
         self.val_dataset = SingleCellDataset(
@@ -349,6 +375,8 @@ class DataModule(pl.LightningDataModule):
             batch_properties=self.batch_properties,
             batch_size=self.batch_size,
             protein_coding_only=self.protein_coding_only,
+            cell_restrictions=self.cell_restrictions,
+            gene_idx=self.train_dataset.gene_idx,
             training=False,
         )
 
