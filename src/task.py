@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from torch.distributions import Normal, kl_divergence as kl
-from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
+import torch.nn.functional as F
 from torchmetrics import MetricCollection, ExplainedVariance
 from torchmetrics.classification import Accuracy
 from modules import one_hot
@@ -18,7 +18,6 @@ from distributions import (
     Poisson,
 )
 
-torch.set_float32_matmul_precision('medium')
 
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
@@ -67,6 +66,8 @@ class LitVAE(pl.LightningModule):
 
         self._create_results_dict()
 
+        self.val_score = -999.0
+
         # self.automatic_optimization = False
 
     def _create_results_dict(self):
@@ -81,6 +82,7 @@ class LitVAE(pl.LightningModule):
         self.results["latent"] = []
         self.results["cell_mask"] = []
         self.results["gene_vals"] = []
+        self.results["cell_idx"] = []
 
     def _cell_properties_metrics(self):
 
@@ -198,8 +200,7 @@ class LitVAE(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
 
-        gene_vals, cell_targets, cell_mask, batch_labels, batch_mask = batch
-        print("DDD", gene_vals.size(), cell_targets.size())
+        gene_vals, cell_targets, cell_mask, batch_labels, batch_mask, cell_idx = batch
         qz_m, qz_v, z = self.network.z_encoder(gene_vals, batch_labels, batch_mask)
         ql_m, ql_v, library = self.network.l_encoder(gene_vals, batch_labels, batch_mask)
         px_scale, _, px_rate, px_dropout = self.network.decoder(self.dispersion, z, library, batch_labels, batch_mask)
@@ -223,9 +224,9 @@ class LitVAE(pl.LightningModule):
             training=False,
         )
 
+        self.results["cell_idx"].append(cell_idx.detach().cpu().numpy())
         if self.save_gene_vals:
             self.results["gene_vals"].append(gene_vals.detach().cpu().numpy().astype(np.uint8))
-
 
         if self.cell_properties is not None:
             cell_pred = self.network.cell_decoder(qz_m)
@@ -237,19 +238,25 @@ class LitVAE(pl.LightningModule):
 
     def on_validation_epoch_end(self):
 
-        v = self.trainer.logger.version
-        fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results.pkl"
-        for k in self.cell_properties.keys():
-            self.results[k] = np.concatenate(self.results[k], axis=0)
-            self.results["pred_" + k] = np.concatenate(self.results["pred_" + k], axis=0)
-        if self.batch_properties is not None:
-            for k in self.batch_properties.keys():
-                self.results[k] = np.concatenate(self.results[k], axis=0)
-        if self.save_gene_vals:
-            self.results["gene_vals"] = np.concatenate(self.results["gene_vals"], axis=0)
-        self.results["cell_mask"] = np.concatenate(self.results["cell_mask"], axis=0)
+        new_val_score = self.cell_explained_var["CERAD"].compute() + self.cell_explained_var["BRAAK_AD"].compute()
+        new_val_score = new_val_score.detach().cpu().numpy()
+        if new_val_score > self.val_score:
+            self.val_score = new_val_score
 
-        pickle.dump(self.results, open(fn, "wb"))
+            v = self.trainer.logger.version
+            fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results.pkl"
+            for k in self.cell_properties.keys():
+                self.results[k] = np.concatenate(self.results[k], axis=0)
+                self.results["pred_" + k] = np.concatenate(self.results["pred_" + k], axis=0)
+            if self.batch_properties is not None:
+                for k in self.batch_properties.keys():
+                    self.results[k] = np.concatenate(self.results[k], axis=0)
+            if self.save_gene_vals:
+                self.results["gene_vals"] = np.concatenate(self.results["gene_vals"], axis=0)
+            self.results["cell_mask"] = np.concatenate(self.results["cell_mask"], axis=0)
+            self.results["cell_idx"] = np.concatenate(self.results["cell_idx"], axis=0)
+
+            pickle.dump(self.results, open(fn, "wb"))
 
         self.results["epoch"] = self.current_epoch + 1
         for k in self.cell_properties.keys():
@@ -261,6 +268,7 @@ class LitVAE(pl.LightningModule):
         self.results["latent"] = []
         self.results["cell_mask"] = []
         self.results["gene_vals"] = []
+        self.results["cell_idx"] = []
 
     def cell_scores(self, cell_pred, cell_targets, cell_mask, latent_mean):
 
@@ -268,11 +276,11 @@ class LitVAE(pl.LightningModule):
             idx = torch.nonzero(cell_mask[:, n])
             if cell_prop["discrete"]:
                 pred_idx = torch.argmax(cell_pred[k], dim=-1).to(torch.int64)
-                pred_prop = cell_pred[k][:, -1].to(torch.float32).detach().cpu().numpy()
+                pred_prob = F.softmax(cell_pred[k], dim=-1).to(torch.float32).detach().cpu().numpy()
                 targets = cell_targets[:, n].to(torch.int64)
                 self.cell_accuracy[k].update(pred_idx[idx][None, :], targets[idx][None, :])
                 self.results[k].append(targets.detach().cpu().numpy())
-                self.results["pred_" + k].append(sigmoid(pred_prop))
+                self.results["pred_" + k].append(pred_prob)
             else:
                 pred = torch.squeeze(cell_pred[k])
                 self.cell_explained_var[k].update(pred[idx], cell_targets[idx, n])
@@ -307,7 +315,7 @@ class LitVAE(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
 
-        gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask = batch
+        gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, _ = batch
 
         # qz_m is the mean of the latent, qz_v is the variance, and z is the sampled latent
         qz_m, qz_v, z = self.network.z_encoder(gene_vals, batch_labels, batch_mask)
@@ -478,6 +486,7 @@ class LitVAE(pl.LightningModule):
         )
 
         lr_scheduler = WarmupConstantSchedule(opt, 2_000)
+        #lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.1, patience=10
 
         scheduler = {
             'scheduler': lr_scheduler,
@@ -486,7 +495,16 @@ class LitVAE(pl.LightningModule):
             'reduce_on_plateau': False,
             'monitor': None,
         }
+        """
 
+        scheduler = {
+            'scheduler': lr_scheduler,
+            'interval': 'step',
+            'frequency': 1,
+            'reduce_on_plateau': True,
+            'monitor': "val_score",
+        }
+        """
         return [opt], [scheduler]
 
 
@@ -501,6 +519,7 @@ class WarmupConstantSchedule(LambdaLR):
         super(WarmupConstantSchedule, self).__init__(optimizer, self.lr_lambda, last_epoch=last_epoch)
 
     def lr_lambda(self, step):
+
         if step < self.warmup_steps:
             return float(step) / float(max(1.0, self.warmup_steps))
         else:
