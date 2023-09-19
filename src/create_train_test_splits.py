@@ -60,8 +60,8 @@ class Splits:
 
 if __name__ == "__main__":
 
-    metadata_fn = "/home/masse/work/perceiver/mssm_rush_data_all_genes/train_metadata.pkl"
-    save_fn = "/home/masse/work/vae/data/train_test_splits.pkl"
+    metadata_fn = "/home/masse/work/data/mssm_rush/metadata.pkl"
+    save_fn = "/home/masse/work/data/mssm_rush/train_test_splits.pkl"
 
     splits = Splits(metadata_fn, save_fn)
     splits.create_splits()
