@@ -12,7 +12,7 @@ from distributions import (
     NegativeBinomial,
     Poisson,
 )
-from modules import Encoder, CellDecoder, DecoderSCVI, one_hot
+from modules import Encoder, GroupedEncoder, CellDecoder, DecoderSCVI, one_hot
 
 
 # VAE model
@@ -68,6 +68,7 @@ class VAE(nn.Module):
         log_variational: bool = True,
         reconstruction_loss: str = "zinb",
         latent_distribution: str = "normal",
+        grouped_encoder: bool = False,
     ):
         super().__init__()
         self.dispersion = dispersion
@@ -96,18 +97,36 @@ class VAE(nn.Module):
 
         print("n_input", n_input, "n_hidden", n_hidden)
 
+        n_properties = len(cell_properties)
         # z encoder goes from the n_input-dimensional data to an n_latent-d
         # latent space representation
-        self.z_encoder = Encoder(
-            n_input,
-            n_latent,
-            batch_properties=batch_properties,
-            n_layers=n_layers,
-            n_hidden=n_hidden,
-            dropout_rate=dropout_rate,
-            input_dropout_rate=input_dropout_rate,
-            distribution=latent_distribution,
-        )
+        if grouped_encoder:
+            self.z_encoder = GroupedEncoder(
+                n_input,
+                n_latent,
+                cell_properties,
+                batch_properties=batch_properties,
+                n_layers=n_layers,
+                n_hidden=n_hidden,
+                dropout_rate=dropout_rate,
+                input_dropout_rate=input_dropout_rate,
+                latent_distribution=latent_distribution,
+            )
+        else:
+            self.z_encoder = Encoder(
+                n_input,
+                n_latent,
+                batch_properties=batch_properties,
+                n_layers=n_layers,
+                n_hidden=n_hidden,
+                dropout_rate=dropout_rate,
+                input_dropout_rate=input_dropout_rate,
+                distribution=latent_distribution,
+            )
+
+        if cell_properties is not None:
+            self.cell_decoder = CellDecoder(n_latent_cell_decoder, cell_properties, grouped=grouped_encoder)
+
         # l encoder goes from n_input-dimensional data to 1-d library size
         self.l_encoder = Encoder(
             n_input,
@@ -119,16 +138,13 @@ class VAE(nn.Module):
         )
         # decoder goes from n_latent-dimensional space to n_input-d data
         self.decoder = DecoderSCVI(
-            n_latent,
+            n_latent * n_properties if grouped_encoder else n_latent,
             n_input,
             n_layers=n_layers,
             n_hidden=n_hidden_decoder,
             batch_properties=batch_properties,
             dropout_rate=dropout_rate,
         )
-
-        if cell_properties is not None:
-            self.cell_decoder = CellDecoder(n_latent_cell_decoder, cell_properties)
 
 
     def get_latents(self, x, y=None) -> torch.Tensor:
@@ -466,5 +482,4 @@ def load_model(model_save_path, model):
     model.load_state_dict(state_dict, strict=True)
     print(f"Number of params loaded: {len(params_loaded)}")
     print(f"Non-network parameters not loaded: {non_network_params}")
-
     return model

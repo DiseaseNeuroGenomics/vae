@@ -20,6 +20,34 @@ def one_hot(index, n_cat):
     return onehot.type(torch.float32)
 
 
+class ResidualLayer(nn.Module):
+
+    def __init__(
+        self,
+        n_in: int,
+        n_hidden: int,
+        dropout_rate: float = 0.1,
+    ):
+
+        super().__init__()
+        self.ff0 = nn.Linear(n_in, n_hidden)
+        self.ff1 = nn.Linear(n_hidden, n_in)
+        self.ln = nn.LayerNorm(n_in, elementwise_affine=False)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(p=float(dropout_rate))
+        self.soft = nn.Softmax(dim=-1)
+
+    def forward(self, input: torch.Tensor):
+
+        x = self.ff0(input)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.ff1(x)
+
+
+        return self.ln(input + x)
+
+
 class FCLayers(nn.Module):
     r"""A helper class to build fully-connected layers for a neural network.
 
@@ -56,16 +84,16 @@ class FCLayers(nn.Module):
         n = n_hidden if n_layers > 1 else n_hidden - np.sum(self.batch_dims)
         self.ff0 = nn.Linear(n_in, n)
         self.drop = nn.Dropout(p=float(dropout_rate))
-        self.ln = nn.LayerNorm(n, elementwise_affine=False)
-
+        self.ln = nn.LayerNorm(n, elementwise_affine=True)
         layers_dim = [n_hidden + np.sum(self.batch_dims)] + (n_layers - 1) * [n_hidden] + [n_out]
 
         layers = []
         for n in range(n_layers - 1):
             layers.append(nn.Linear(layers_dim[n], layers_dim[n + 1]))
             layers.append(nn.GELU())
-            layers.append(nn.LayerNorm(n_hidden, elementwise_affine=False))
+            layers.append(nn.LayerNorm(n_hidden, elementwise_affine=True))
             layers.append(nn.Dropout(p=float(dropout_rate)))
+            #layers.append(ResidualLayer(n_hidden, 2 * n_hidden, dropout_rate=dropout_rate))
 
         self.fc_layers = nn.Sequential(*layers)
 
@@ -78,6 +106,7 @@ class FCLayers(nn.Module):
         x = self.ln(x)
 
         if np.sum(self.batch_dims) > 0:
+            batch_vals[batch_vals < 0] = 0
             batch_vars = []
             for n in range(len(self.batch_dims)):
                 b = F.one_hot(batch_vals[:, n], num_classes=self.batch_dims[n])
@@ -87,6 +116,61 @@ class FCLayers(nn.Module):
 
         return self.fc_layers(x)
 
+class GroupedEncoder(nn.Module):
+    r"""Encodes data of ``n_input`` dimensions into a latent space of ``n_output``
+    dimensions using a fully-connected neural network of ``n_hidden`` layers.
+
+    :param n_input: The dimensionality of the input (data space)
+    :param n_output: The dimensionality of the output (latent space)
+    :param n_layers: The number of fully-connected hidden layers
+    :param n_hidden: The number of nodes per hidden layer
+    :dropout_rate: Dropout rate to apply to each of the hidden layers
+    :param distribution: Distribution of z
+    """
+
+    def __init__(
+        self,
+        n_input: int,
+        n_latent: int,
+        cell_properties: Optional[Dict[str, Any]] = None,
+        batch_properties: Optional[Dict[str, Any]] = None,
+        n_layers: int = 1,
+        n_hidden: int = 128,
+        dropout_rate: float = 0.1,
+        input_dropout_rate: float = 0.0,
+        latent_distribution: str = "normal"
+    ):
+        super().__init__()
+
+        self.z_enc = nn.ModuleDict()
+        self.cell_properties = cell_properties
+        self.cell_predict = nn.ModuleDict()
+
+        for k in cell_properties.keys():
+
+            self.z_enc[k] = Encoder(
+                n_input,
+                n_latent,
+                batch_properties=batch_properties,
+                n_layers=n_layers,
+                n_hidden=n_hidden,
+                dropout_rate=dropout_rate,
+                input_dropout_rate=input_dropout_rate,
+                distribution=latent_distribution,
+            )
+
+    def forward(self, x: torch.Tensor, batch_labels: torch.Tensor, batch_mask: torch.Tensor):
+
+        q_m = []
+        q_v = []
+        latent = []
+        for k in self.cell_properties.keys():
+            q_m_k, q_v_k, latent_k = self.z_enc[k](x, batch_labels, batch_mask)
+            q_m.append(q_m_k)
+            q_v.append(q_v_k)
+            latent.append(latent_k)
+
+        return torch.cat(q_m, dim=-1), torch.cat(q_v, dim=-1), torch.cat(latent, dim=-1)
 
 # Encoder
 class Encoder(nn.Module):
@@ -125,6 +209,7 @@ class Encoder(nn.Module):
         )
         self.mean_encoder = nn.Linear(n_hidden, n_output)
         self.var_encoder = nn.Linear(n_hidden, n_output)
+        #self.bn = nn.BatchNorm1d(n_input, momentum=0.05, eps=1.0)
 
         if distribution == "ln":
             self.z_transformation = nn.Softmax(dim=-1)
@@ -135,18 +220,11 @@ class Encoder(nn.Module):
         self.softplus = nn.Softplus()
 
     def forward(self, x: torch.Tensor, batch_labels: torch.Tensor, batch_mask: torch.Tensor):
-        r"""The forward computation for a single sample.
 
-         #. Encodes the data into latent space using the encoder network
-         #. Generates a mean \\( q_m \\) and variance \\( q_v \\) (clamped to \\( [-5, 5] \\))
-         #. Samples a new value from an i.i.d. multivariate normal \\( \\sim Ne(q_m, \\mathbf{I}q_v) \\)
-
-        :param x: tensor with shape (n_input,)
-        :param cat_list: list of category membership(s) for this sample
-        :return: tensors of shape ``(n_latent,)`` for mean and var, and sample
-        :rtype: 3-tuple of :py:class:`torch.Tensor`
-        """
-        x = self.drop(x) - 0.54  # 0.54 is the approximate mean of x
+        x = x - x.mean(dim=-1, keepdim=True)
+        x = self.drop(x)   # 0.54 is the approximate mean of x
+        #x = self.bn(x)
+        #x = self.drop(x)
         # Parameters for latent distribution
         q = self.encoder(x, batch_labels, batch_mask)
         q_m = self.mean_encoder(q)
@@ -161,12 +239,17 @@ class CellDecoder(nn.Module):
         self,
         latent_dim: int,
         cell_properties: Dict[str, Any],
+        grouped: bool = False,
+        subject_batch_size: int =1,
     ):
         super().__init__()
 
         self.latent_dim = latent_dim
         self.cell_properties = cell_properties
+        self.grouped = grouped
+        self.subject_batch_size = subject_batch_size
         self.cell_mlp = nn.ModuleDict()
+
         for k, cell_prop in cell_properties.items():
             # the output size of the cell property prediction MLP will be 1 if the property is continuous;
             # if it is discrete, then it will be the length of the possible values
@@ -177,11 +260,15 @@ class CellDecoder(nn.Module):
     def forward(self, latent: torch.Tensor):
 
         # Predict cell properties
-        latent = latent[:, : self.latent_dim]
         output = {}
-        for k, cell_prop in self.cell_properties.items():
-            x = latent.detach() if cell_prop["stop_grad"] else latent
+        for n, (k, cell_prop) in enumerate(self.cell_properties.items()):
+            u = latent[:, n * self.latent_dim: (n + 1) * self.latent_dim] if self.grouped else latent
+            x = u.detach() if cell_prop["stop_grad"] else u
+            if self.subject_batch_size > 1:
+                x = torch.reshape(x, (-1, 8, x.size()[-1])).mean(dim=1)
+
             output[k] = self.cell_mlp[k](x)
+
         return output
 
 

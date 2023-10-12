@@ -71,10 +71,24 @@ class CreateData:
             "obs": {k: self.anndata.obs[k][self.cell_idx].values for k in self.obs_keys},
             "var": {k: self.anndata.var[k][self.gene_idx].values for k in self.var_keys},
         }
-        meta["obs"]["barcode"] = list(np.array(self.anndata.obs.index))[self.cell_idx]
+        meta = self._add_graded_dementia(meta)
+        meta["obs"]["barcode"] = list(np.array(self.anndata.obs.index)[self.cell_idx])
 
         meatadata_fn = os.path.join(self.target_path, "metadata.pkl")
         pickle.dump(meta, open(meatadata_fn, "wb"))
+
+    @staticmethod
+    def _add_graded_dementia(meta):
+
+        meta["obs"]["Dementia_graded"] = np.array(meta["obs"]["Dementia"]).astype(np.float32)
+        idx = np.where((meta["obs"]["Dementia"] == 0) * (meta["obs"]["MCI"] == 0))[0]
+        meta["obs"]["Dementia_graded"][idx] = 0.0
+        idx = np.where((meta["obs"]["Dementia"] == 0) * (meta["obs"]["MCI"] == 1))[0]
+        meta["obs"]["Dementia_graded"][idx] = 0.5
+        idx = np.where((meta["obs"]["Dementia"] == 1) * (meta["obs"]["MCI"] == 0))[0]
+        meta["obs"]["Dementia_graded"][idx] = 1.0
+
+        return meta
 
     def _get_gene_index(self):
 
