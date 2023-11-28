@@ -1,9 +1,8 @@
 from typing import Any, Dict, List, Optional
 
-import math
+import shutil
 import pickle
 import numpy as np
-from copy import deepcopy
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
@@ -18,11 +17,12 @@ from distributions import (
     NegativeBinomial,
     Poisson,
 )
-
+from losses import GroupDRO
 import scipy.stats as stats
 
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
+
 
 # define the LightningModule
 class LitVAE(pl.LightningModule):
@@ -44,7 +44,7 @@ class LitVAE(pl.LightningModule):
         library_mean: Optional[float] = None,
         library_var: Optional[float] = None,
         subject_batch_size: int = 1,
-
+        use_gdro: bool = True,
 
     ):
         super().__init__()
@@ -75,8 +75,26 @@ class LitVAE(pl.LightningModule):
         self._create_results_dict()
 
         self.val_score = -999.0
+        self.train_step = 0
 
-        # self.automatic_optimization = False
+        self.use_gdro = use_gdro
+        if use_gdro:
+
+            balances_dm = [
+                [0, 1, 10, 11, 20, 21, 30, 31, 40, 41, 50, 51, 60, 61],
+            ]
+
+            balances_braak = [
+                [0, 1, 60, 61],
+                [10, 11, 50, 51],
+                [20, 21, 40, 41],
+                [30, 31],
+            ]
+
+            self.gdro = {
+                "Dementia": GroupDRO(balances=balances_dm), "BRAAK_AD": GroupDRO(balances=balances_braak)
+            }
+
 
     def _create_results_dict(self):
 
@@ -89,7 +107,7 @@ class LitVAE(pl.LightningModule):
                 self.results[k] = []
         self.results["latent"] = []
         self.results["cell_mask"] = []
-        self.results["gene_vals"] = []
+        self.results["px_r"] = []
         self.results["cell_idx"] = []
 
     def _cell_properties_metrics(self):
@@ -106,7 +124,8 @@ class LitVAE(pl.LightningModule):
                     np.float32(np.clip(1 / cell_prop["freq"], 0.1, 10.0))
                 ) if self.balance_classes else None
                 self.cell_cross_ent[k] = nn.CrossEntropyLoss(weight=weight, reduction="none", ignore_index=-100)
-                # self.cell_cross_ent[k] = FocalLoss(gamma = 2.0)
+                # self.cell_cross_ent[k] = FocalLoss(len(cell_prop["values"]), gamma=2.0, alpha=5.0)
+                # self.cell_cross_ent[k] = Poly1FocalLoss(len(cell_prop["values"]), gamma=2.0)
                 self.cell_accuracy[k] = Accuracy(
                     task="multiclass", num_classes=len(cell_prop["values"]), average="macro",
                 )
@@ -114,6 +133,7 @@ class LitVAE(pl.LightningModule):
                 # continuous variable, set up MSE module
                 self.cell_mse[k] = nn.MSELoss(reduction="none")
                 self.cell_explained_var[k] = ExplainedVariance()
+
 
     def get_reconstruction_loss(
         self,
@@ -173,7 +193,7 @@ class LitVAE(pl.LightningModule):
 
         recon_loss = self.get_reconstruction_loss(x, px_rate, px_r, px_dropout)
 
-        loss = (recon_loss + kl_l + self.kl_weight * kl_z).mean()
+        loss = self.kl_weight * (recon_loss + kl_l + 1.0 * kl_z).mean()
 
         if training:
             self.log("recon_loss", recon_loss.mean(), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
@@ -234,7 +254,7 @@ class LitVAE(pl.LightningModule):
 
         self.results["cell_idx"].append(cell_idx.detach().cpu().numpy())
         if self.save_gene_vals:
-            self.results["gene_vals"].append(gene_vals.detach().cpu().numpy().astype(np.uint8))
+            self.results["px_r"].append(px_rate.detach().cpu().numpy().astype(np.float32))
 
         if self.cell_properties is not None:
             cell_pred = self.network.cell_decoder(qz_m)
@@ -246,34 +266,45 @@ class LitVAE(pl.LightningModule):
 
     def on_validation_epoch_end(self):
 
-        new_val_score = self.cell_explained_var["CERAD"].compute() + self.cell_explained_var["BRAAK_AD"].compute() + self.cell_explained_var["Dementia_graded"].compute()
-        # new_val_score = self.cell_explained_var["BRAAK_AD"].compute()
-        #new_val_score = self.cell_accuracy["AD"].compute()
-        self.log("val_score", new_val_score, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
-        new_val_score = new_val_score.detach().cpu().numpy()
-        if new_val_score > self.val_score:
-            self.val_score = new_val_score
 
-            v = self.trainer.logger.version
-            fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results.pkl"
-            for k in self.cell_properties.keys():
+        new_val_score = 0.0
+        for k in self.cell_explained_var.keys():
+            new_val_score += self.cell_explained_var[k].compute()
+        for k in self.cell_accuracy.keys():
+            new_val_score += self.cell_accuracy[k].compute()
+
+        self.log("val_score", new_val_score, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+
+        for k in self.cell_properties.keys():
+            self.results[k] = np.concatenate(self.results[k], axis=0)
+            self.results["pred_" + k] = np.concatenate(self.results["pred_" + k], axis=0)
+        if self.batch_properties is not None:
+            for k in self.batch_properties.keys():
                 self.results[k] = np.concatenate(self.results[k], axis=0)
-                self.results["pred_" + k] = np.concatenate(self.results["pred_" + k], axis=0)
-            if self.batch_properties is not None:
-                for k in self.batch_properties.keys():
-                    self.results[k] = np.concatenate(self.results[k], axis=0)
-            if self.save_gene_vals:
-                self.results["gene_vals"] = np.concatenate(self.results["gene_vals"], axis=0)
-            self.results["cell_mask"] = np.concatenate(self.results["cell_mask"], axis=0)
-            self.results["cell_idx"] = np.concatenate(self.results["cell_idx"], axis=0)
-            x0 = self.results["pred_CERAD"]
+        if self.save_gene_vals:
+            self.results["px_r"] = np.concatenate(self.results["px_r"], axis=0)
+        self.results["cell_mask"] = np.concatenate(self.results["cell_mask"], axis=0)
+        self.results["cell_idx"] = np.concatenate(self.results["cell_idx"], axis=0)
+
+        if "Dementia" in self.cell_accuracy and "BRAAK_AD" in self.cell_explained_var:
+            x0 = self.results["pred_Dementia"][:, 1]
             x1 = self.results["pred_BRAAK_AD"]
-            #x2 = self.results["pred_Dementia"][:, 1]
             idx = np.where((x0 > -9) * (x1 > -9))[0]
             r, p = stats.pearsonr(x0[idx], x1[idx])
             self.log("corr", r, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
+
+        v = self.trainer.logger.version
+        fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results.pkl"
+        pickle.dump(self.results, open(fn, "wb"))
+        src = "/home/masse/work/vae/src/config.py"
+        shutil.copyfile(src, f"{self.trainer.log_dir}/lightning_logs/version_{v}/config.py")
+
+
+        if self.current_epoch >= self.trainer.max_epochs - 4:
+            fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results_ep{self.current_epoch}.pkl"
             pickle.dump(self.results, open(fn, "wb"))
+
 
         self.results["epoch"] = self.current_epoch + 1
         for k in self.cell_properties.keys():
@@ -284,7 +315,7 @@ class LitVAE(pl.LightningModule):
                 self.results[k] = []
         self.results["latent"] = []
         self.results["cell_mask"] = []
-        self.results["gene_vals"] = []
+        self.results["px_r"] = []
         self.results["cell_idx"] = []
 
     def cell_scores(self, cell_pred, cell_targets, cell_mask, latent_mean):
@@ -295,6 +326,7 @@ class LitVAE(pl.LightningModule):
         for n, (k, cell_prop) in enumerate(self.cell_properties.items()):
 
             idx = torch.nonzero(cell_mask[:, n])
+
             if cell_prop["discrete"]:
                 pred_idx = torch.argmax(cell_pred[k], dim=-1).to(torch.int64)
                 pred_prob = F.softmax(cell_pred[k], dim=-1).to(torch.float32).detach().cpu().numpy()
@@ -310,7 +342,7 @@ class LitVAE(pl.LightningModule):
             else:
                 pred = torch.squeeze(cell_pred[k])
                 if self.subject_batch_size > 1:
-                    targets = torch.reshape(cell_targets[:, n], (-1, 8)).mean(dim=1)
+                    targets = torch.reshape(cell_targets[:, n], (-1, self.subject_batch_size)).mean(dim=1)
                     targets = targets[idx]
                     self.cell_explained_var[k].update(pred[idx], targets)
                 else:
@@ -332,34 +364,39 @@ class LitVAE(pl.LightningModule):
         cell_pred: Dict[str, torch.Tensor],
         cell_prop_vals: torch.Tensor,
         cell_mask: torch.Tensor,
-        freq: torch.Tensor,
+        group_idx: torch.Tensor,
     ):
 
         cell_loss = 0.0
+
         for n, (k, cell_prop) in enumerate(self.cell_properties.items()):
 
-            if cell_prop["discrete"]:
-                if self.subject_batch_size > 1:
-                    y = torch.reshape(cell_prop_vals[:, n], (-1, 8)).mean(dim=1).to(torch.int64)
-                    cross_ent = self.cell_cross_ent[k](cell_pred[k], y)
-                else:
-                    cross_ent = self.cell_cross_ent[k](cell_pred[k], cell_prop_vals[:, n].to(torch.int64))
-                cell_loss += (cross_ent * cell_mask[:, n] * freq).mean()
+            if self.use_gdro and k in self.gdro.keys() and self.train_step >= 500:
+                weights = self.gdro[k].get_weights(group_idx).to(cell_pred[k].device)
             else:
-                if self.subject_batch_size > 1:
-                    y = torch.reshape(cell_prop_vals[:, n], (-1, 8)).mean(dim=1)
-                    m = torch.reshape(cell_mask[:, n], (-1, 8)).mean(dim=1)
-                    mse = self.cell_mse[k](torch.squeeze(cell_pred[k]), y)
-                    cell_loss += (mse * m).mean()
-                else:
-                    mse = self.cell_mse[k](torch.squeeze(cell_pred[k]), cell_prop_vals[:, n])
-                    cell_loss += (mse * cell_mask[:, n] * freq).mean()
+                weights = 1.0
+
+            if cell_prop["discrete"]:
+                loss = self.cell_cross_ent[k](cell_pred[k], cell_prop_vals[:, n].to(torch.int64))
+                cell_loss += (weights * loss * cell_mask[:, n]).mean()
+
+            else:
+                loss = self.cell_mse[k](torch.squeeze(cell_pred[k]), cell_prop_vals[:, n])
+                cell_loss += (weights * loss * cell_mask[:, n]).mean()
+
+            if self.use_gdro and k in self.gdro.keys() and self.use_gdro:
+                self.gdro[k].update_batch(loss, cell_mask[:, n], group_idx)
+
+            if self.use_gdro and k in self.gdro.keys():
+                self.gdro[k].update_weights()
 
         return cell_loss
 
     def training_step(self, batch, batch_idx):
 
-        gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, _, freq = batch
+        self.train_step += 1
+
+        gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, _, group_idx = batch
 
         # qz_m is the mean of the latent, qz_v is the variance, and z is the sampled latent
         qz_m, qz_v, z = self.network.z_encoder(gene_vals, batch_labels, batch_mask)
@@ -373,7 +410,7 @@ class LitVAE(pl.LightningModule):
 
         if self.cell_properties is not None:
             cell_pred = self.network.cell_decoder(z)
-            cell_loss = self._cell_loss(cell_pred, cell_prop_vals, cell_mask, freq)
+            cell_loss = self._cell_loss(cell_pred, cell_prop_vals, cell_mask, group_idx)
         else:
             cell_loss = 0.0
 
@@ -438,8 +475,21 @@ class LitVAE(pl.LightningModule):
 
     def configure_optimizers(self):
 
+        encoder_params = []
+        other_params = []
+        for n, p in self.network.named_parameters():
+            if "z_encoder" in n or "cell_decoder" in n:
+                encoder_params.append(p)
+            else:
+                other_params.append(p)
+
+
+
         opt = torch.optim.AdamW(
-            self.network.parameters(),
+            [
+                {'params': encoder_params, "weight_decay": self.weight_decay},
+                {'params': other_params, "weight_decay":0.0},
+            ],
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
             betas=(0.9, 0.998),
@@ -468,8 +518,6 @@ class WarmupConstantAndDecaySchedule(LambdaLR):
         self.warmup_steps = warmup_steps
         self.alpha = np.sqrt(warmup_steps)
         super(WarmupConstantAndDecaySchedule, self).__init__(optimizer, self.lr_lambda, last_epoch=last_epoch)
-
-
 
     def lr_lambda(self, step):
         arg1 = (step + 1) ** (-0.5)

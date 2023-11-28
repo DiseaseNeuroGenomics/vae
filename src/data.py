@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import numpy as np
 import pickle
@@ -22,7 +22,6 @@ class SingleCellDataset(Dataset):
         cell_idx: List[int],
         cell_properties: Optional[Dict[str, Any]] = None,
         batch_properties: Optional[Dict[str, Any]] = None,
-        frequency: Optional[np.array] = None,
         batch_size: int = 64,
         max_cell_prop_val: float = 999,
         protein_coding_only: bool = False,
@@ -30,21 +29,34 @@ class SingleCellDataset(Dataset):
         max_gene_val: Optional[float] = 6.0,
         gene_idx: Optional[List[int]] = None,
         subject_batch_size: int = 1,
+        group_balancing: Literal[None, "bcd", "bc"] = "bcd",
+        mixup: bool = True,
+        cutmix: bool = False,
         training: bool = True,
-
     ):
 
+        self.count = 0
+
         self.metadata = pickle.load(open(metadata_path, "rb"))
+        self._convert_apoe()
         self.data_path = data_path
         self.cell_idx = cell_idx
         self.n_samples = len(cell_idx)
         self.cell_properties = cell_properties
         self.batch_properties = batch_properties
-        self.frequency = frequency
+        self.batch_size = batch_size
         self.subject_batch_size = subject_batch_size
+        self.group_balancing = group_balancing
+        self.mixup = mixup
+        self.cutmix = cutmix
+
+        print(f"Using Mixup: {self.mixup}")
         self.training = training
 
         self._restrict_samples(cell_restrictions)
+
+        if self.group_balancing is not None:
+            self._define_groups()
 
         print(f"Number of cells {self.n_samples}")
         if "gene_name" in self.metadata["var"].keys():
@@ -68,7 +80,7 @@ class SingleCellDataset(Dataset):
 
         # this will down-sample the number if genes if specified
         if gene_idx is None:
-            #self._gene_stats()
+            # self._gene_stats()
             self._get_gene_index()
         else:
             self.gene_idx = gene_idx
@@ -80,10 +92,98 @@ class SingleCellDataset(Dataset):
     def __len__(self):
         return self.n_samples
 
+    def _convert_apoe(self):
+
+        self.metadata["obs"]["apoe"] = np.zeros_like(self.metadata["obs"]["ApoE_gt"])
+        idx = np.where(self.metadata["obs"]["ApoE_gt"] == 44)[0]
+        self.metadata["obs"]["apoe"][idx] = 2
+        idx = np.where((self.metadata["obs"]["ApoE_gt"] == 24) + (self.metadata["obs"]["ApoE_gt"] == 34))[0]
+        self.metadata["obs"]["apoe"][idx] = 1
+        idx = np.where(np.isnan(self.metadata["obs"]["ApoE_gt"]))[0]
+        self.metadata["obs"]["apoe"][idx] = np.nan
+
+
+    def _define_groups(self):
+        """used to address clsss/attribute imabalance
+        Simple data balancing achieves competitive worst-group-accuracy
+        https://arxiv.org/pdf/2110.14503.pdf"""
+
+        if self.group_balancing == "cd":
+            self.group_idx = {}
+            for c in range(1, 5):
+                for d in range(2):
+                    cond = (self.metadata["obs"]["Dementia"] == d) * (self.metadata["obs"]["CERAD"] == c)
+                    idx = np.where(cond)[0]
+                    i = (c-1) * 10 + d
+                    self.group_idx[i] = idx.tolist()
+
+            cond = (self.metadata["obs"]["Dementia"] < 0) + (self.metadata["obs"]["CERAD"] < 0)
+            idx = np.where(cond)[0]
+            self.group_idx[999] = idx.tolist()
+
+        elif self.group_balancing == "bd":
+            self.group_idx = {}
+            for b in range(7):
+                for d in range(2):
+                    cond = (self.metadata["obs"]["Dementia"] == d) * (
+                                self.metadata["obs"]["BRAAK_AD"] == b)
+                    idx = np.where(cond)[0]
+                    i = b * 10 + d
+                    self.group_idx[i] = idx.tolist()
+
+            cond = (self.metadata["obs"]["Dementia"] < 0) + (self.metadata["obs"]["BRAAK_AD"] < 0)
+            idx = np.where(cond)[0]
+            self.group_idx[999] = idx.tolist()
+
+            #cond = (self.metadata["obs"]["Dementia"] > - 99) + (self.metadata["obs"]["BRAAK_AD"] > - 99)
+            #idx = np.where(cond)[0]
+            #self.group_idx[998] = idx.tolist()
+
+        elif self.group_balancing == "bd5":
+            self.group_idx = {}
+            for b in range(6):
+                for d in range(2):
+                    cond = (self.metadata["obs"]["Dementia"] == d) * (
+                            self.metadata["obs"]["BRAAK_AD5"] == b)
+                    idx = np.where(cond)[0]
+                    i = b * 10 + d
+                    self.group_idx[i] = idx.tolist()
+
+            cond = (self.metadata["obs"]["Dementia"] < 0) + (self.metadata["obs"]["BRAAK_AD5"] < 0)
+            idx = np.where(cond)[0]
+            self.group_idx[999] = idx.tolist()
+
+
+        elif self.group_balancing == "bcd":
+            self.group_idx = {}
+            for b in range(9):
+                for d in range(2):
+                    cond = (self.metadata["obs"]["Dementia"] == d) * (
+                                self.metadata["obs"]["BRAAK_CERAD"] == b)
+                    idx = np.where(cond)[0]
+                    i = b * 10 + d
+                    self.group_idx[i] = idx.tolist()
+
+            cond = (self.metadata["obs"]["Dementia"] < 0) + (self.metadata["obs"]["BRAAK_CERAD"] < 0)
+            idx = np.where(cond)[0]
+            self.group_idx[999] = idx.tolist()
+
+
+
+        # only include groups with a sufficient (e.g. 250) number of cells
+        self.group_idx = {k: v for k, v in self.group_idx.items() if len(v) >= 250}
+
+        print("Size of each group...")
+        for k, v in self.group_idx.items():
+            print(f"{k}: {len(v)}")
+
+        n_groups = len(self.group_idx)
+        self.cell_per_group = self.batch_size // n_groups
     def _gene_stats(self):
 
-        N = 50_000
+        N = 75_000
         counts = np.zeros(self.n_genes_original, dtype=np.float32)
+        sums = np.zeros(self.n_genes_original, dtype=np.float32)
         idx = self.cell_idx[:N] if len(self.cell_idx) > N else self.cell_idx
 
         for n in idx:
@@ -91,7 +191,9 @@ class SingleCellDataset(Dataset):
                 self.data_path, dtype='uint8', mode='r', shape=(self.n_genes_original,), offset=n * self.offset
             )
             counts += np.clip(data, 0, 1)
+            sums += data
 
+        self.metadata["var"]["mean_expression"] = sums / len(idx)
         self.metadata["var"]["percent_cells"] = 100 * counts / len(idx)
 
     def library_size_stats(self, N: int = 200_000):
@@ -110,28 +212,35 @@ class SingleCellDataset(Dataset):
 
     def _restrict_samples(self, restrictions):
 
-        if restrictions is not None:
-            cond = np.zeros(len(self.metadata["obs"]["class"]), dtype=np.uint8)
-            cond[self.cell_idx] = 1
-            #cond *= self.metadata["obs"]["SCZ"] != 1
-            #cond *= self.metadata["obs"]["ALS"] != 1
-            #cond *= self.metadata["obs"]["Sex"] == "Female"
+        cond = np.zeros(len(self.metadata["obs"]["class"]), dtype=np.uint8)
+        cond[self.cell_idx] = 1
 
+        if not self.training:
+            cond *= self.metadata["obs"]["include_analysis"] == 1
+        else:
+            cond *= self.metadata["obs"]["include_training"] == 1
+            # cond *= self.metadata["obs"]["include_analysis"] == 1
+
+        # cond *= self.metadata["obs"]["Age"] >= 40
+        """
+        cond *= self.metadata["obs"]["ALS"] == 0
+        cond *= self.metadata["obs"]["SCZ"] == 0
+        cond *= self.metadata["obs"]["PD"] == 0
+        cond *= self.metadata["obs"]["ALS"] == 0
+        cond *= self.metadata["obs"]["SCZ"] == 0
+        cond *= self.metadata["obs"]["PD"] == 0
+        """
+
+
+        if restrictions is not None:
             for k, v in restrictions.items():
                 if isinstance(v, list):
-                    cond *= np.sum(np.stack([self.metadata["obs"][k] == v1 for v1 in v]), axis=0)
+                    cond *= np.sum(np.stack([self.metadata["obs"][k] == v1 for v1 in v]), axis=0).astype(np.uint8)
                 else:
                     cond *= self.metadata["obs"][k] == v
 
-            self.cell_idx = np.where(cond)[0]
-            self.n_samples = len(self.cell_idx)
-        """
-        if self.training or True:
-            cond1 = self.metadata["obs"]["Dementia"] == 0
-            cond = cond * cond1
-            self.cell_idx = np.where(cond)[0]
-            self.n_samples = len(self.cell_idx)
-        """
+        self.cell_idx = np.where(cond)[0]
+        self.n_samples = len(self.cell_idx)
 
         for k in self.metadata["obs"].keys():
             self.metadata["obs"][k] = np.array(self.metadata["obs"][k])[self.cell_idx]
@@ -141,14 +250,19 @@ class SingleCellDataset(Dataset):
         print(f"Subtypes: {np.unique(self.metadata['obs']['subtype'])}")
         print(f"APOE: {np.unique(self.metadata['obs']['ApoE_gt'])}")
         print(f"Dementia: {np.unique(self.metadata['obs']['Dementia_graded'])}")
+        print(f"Include analysis: {np.unique(self.metadata['obs']['include_analysis'])}")
+        print(f"Number of subjects: {len(np.unique(self.metadata['obs']['SubID']))}")
 
 
     def _get_gene_index(self):
 
         if self.protein_coding_only:
             cond = 1
-            cond *= self.metadata["var"]['percent_cells'] >= 2.0
-            #cond *= self.metadata["var"]["ribosomal"]
+            cond *= self.metadata["var"]['percent_cells'] >= 0.0
+            # cond *= self.metadata["var"]['mean_expression'] >= 0.0
+            # cond *= self.metadata["var"]['mean_expression'] < 99999
+            # cond *= ~self.metadata["var"]["ribosomal"]
+            # cond *= ~self.metadata["var"]["mitochondrial"]
             # cond *= self.metadata["var"]['gene_chrom'] != "X"
             # cond *= self.metadata["var"]['protein_coding']
 
@@ -198,12 +312,6 @@ class SingleCellDataset(Dataset):
             self.subjects.append(self.metadata["obs"]["SubID"][n0])
             idx = np.where(self.metadata["obs"]["class"][n0] == self.cell_classes)[0]
             self.cell_class[n0] = idx[0]
-
-            d = self.metadata["obs"]["Dementia"][n0]
-            c = self.metadata["obs"]["CERAD"][n0] - 1
-            b = self.metadata["obs"]["BRAAK_AD"][n0]
-            if d >= 0 and c >= 0 and b >= 0:
-                self.cell_freq[n0] = np.clip(1 / self.frequency[d, c, b], 0.1, 10.0)
 
             for n1, (k, cell_prop) in enumerate(self.cell_properties.items()):
                 cell_val = self.metadata["obs"][k][n0]
@@ -256,18 +364,6 @@ class SingleCellDataset(Dataset):
 
     def _prepare_data(self, batch_idx):
 
-        n_original_size = len(batch_idx)
-
-        if self.subject_batch_size > 1:
-            batch_idx = []
-            while len(batch_idx) < n_original_size:
-                subid = np.random.choice(self.unique_subjects)
-                subid_idx = np.nonzero(self.subjects == subid)[0]
-                if len(subid_idx) >= self.subject_batch_size:
-                    idx = np.random.choice(subid_idx, size=self.subject_batch_size, replace=False)
-                    for i in idx:
-                        batch_idx.append(i)
-
         # get input and target data, returned as numpy arrays
         gene_vals = self._get_gene_vals_batch(batch_idx)
         cell_prop_vals, cell_mask, batch_labels, batch_mask = self._get_cell_prop_vals_batch(batch_idx)
@@ -275,17 +371,103 @@ class SingleCellDataset(Dataset):
 
         return gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask
 
+    @staticmethod
+    def _sample_beta_distribution(size, concentration=0.25):
+        gamma_1_sample = np.random.gamma(concentration, size=size)
+        gamma_2_sample = np.random.gamma(concentration, size=size)
+        return gamma_1_sample / (gamma_1_sample + gamma_2_sample)
+
+    def _cutmix(self, gene_vals, cell_vals, cell_mask):
+
+        N = gene_vals.shape[0]
+        alpha = self._sample_beta_distribution(N)
+        new_gene_vals = np.zeros_like(gene_vals)
+        new_cell_vals = np.zeros_like(cell_vals)
+        new_cell_mask = np.zeros_like(cell_mask)
+
+        for i in range(N):
+            if self.group_balancing is not None:
+                k = i // self.cell_per_group
+                possible_partners = list(range(k * self.cell_per_group, (k+1) * self.cell_per_group))
+                #possible_partners = list(range(N))
+            else:
+                possible_partners = list(range(N))
+            j = np.random.choice(possible_partners)
+
+            new_gene_vals[i, :] += gene_vals[i, :]
+            idx_mix = np.random.choice(self.n_genes, int(alpha[i] * self.n_genes), replace=False)
+            new_gene_vals[i, idx_mix] = gene_vals[j, idx_mix]
+            new_cell_vals[i, :] = alpha[i] * cell_vals[i, :] + (1 - alpha[i]) * cell_vals[j, :]
+            new_cell_mask[i, :] = alpha[i] * cell_mask[i, :] + (1 - alpha[i]) * cell_mask[j, :]
+
+        return new_gene_vals, new_cell_vals, new_cell_mask
+
+
+    def _mixup(self, gene_vals, cell_vals, cell_mask):
+
+        N = gene_vals.shape[0]
+        alpha = self._sample_beta_distribution(N)
+        new_gene_vals = np.zeros_like(gene_vals)
+        new_cell_vals = np.zeros_like(cell_vals)
+        new_cell_mask = np.zeros_like(cell_mask)
+
+        for i in range(N):
+            if self.group_balancing is not None:
+                k = i // self.cell_per_group
+                possible_partners = list(range(k * self.cell_per_group, (k+1) * self.cell_per_group))
+                #possible_partners = list(range(N))
+            else:
+                possible_partners = list(range(N))
+            j = np.random.choice(possible_partners)
+            new_gene_vals[i, :] = alpha[i] * gene_vals[i, :] + (1 - alpha[i]) * gene_vals[j, :]
+            new_cell_vals[i, :] = alpha[i] * cell_vals[i, :] + (1 - alpha[i]) * cell_vals[j, :]
+            new_cell_mask[i, :] = alpha[i] * cell_mask[i, :] + (1 - alpha[i]) * cell_mask[j, :]
+
+        return new_gene_vals, new_cell_vals, new_cell_mask
+
+
+    def _get_balanced_batch(self, old_batch_idx):
+
+        batch_idx = []
+        group_idx = []
+        for k, v in self.group_idx.items():
+            idx = np.random.choice(v, size=self.cell_per_group, replace=False)
+            # idx = np.random.choice(v, size=len(v) // 400, replace=False)
+            batch_idx += idx.tolist()
+            group_idx += [k] * self.cell_per_group
+            # group_idx += [k] * (len(v) // 400)
+
+        # assert len(batch_idx) == self.cell_per_group * len(self.group_idx), "Batch size not right"
+
+        # batch_idx = batch_idx[0::4] + batch_idx[1::4] + batch_idx[3::4] + old_batch_idx[::4]
+
+        return batch_idx, group_idx
 
     def __getitem__(self, batch_idx: Union[int, List[int]]):
 
         if isinstance(batch_idx, int):
             batch_idx = [batch_idx]
 
+        if self.training and self.group_balancing is not None and self.count > -1:
+            # if np.random.choice([True, False]):
+            batch_idx, group_idx = self._get_balanced_batch(batch_idx)
+        else:
+            group_idx = None
+
+        self.count += 1
+
         gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask = self._prepare_data(batch_idx)
         cell_idx = self.cell_idx[batch_idx]
-        freq = self.cell_freq[batch_idx]
 
-        return (gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, cell_idx, freq)
+        if self.cutmix and self.training:
+            # does not work with batch labels, cell_mask
+            gene_vals, cell_prop_vals, cell_mask = self._cutmix(gene_vals, cell_prop_vals, cell_mask)
+
+        if self.mixup and self.training:
+            # does not work with batch labels, cell_mask
+            gene_vals, cell_prop_vals, cell_mask = self._mixup(gene_vals, cell_prop_vals, cell_mask)
+
+        return (gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, cell_idx, group_idx)
 
 
 class DataModule(pl.LightningDataModule):
@@ -308,6 +490,8 @@ class DataModule(pl.LightningDataModule):
         batch_properties: Optional[Dict[str, Any]] = None,
         protein_coding_only: bool = False,
         cell_restrictions: Optional[Dict[str, Any]] = None,
+        group_balancing: Literal[None, "bcd", "bc"] = "bcd",
+        mixup: bool = False,
     ):
         super().__init__()
         self.data_path = data_path
@@ -320,12 +504,23 @@ class DataModule(pl.LightningDataModule):
         self.batch_properties = batch_properties
         self.protein_coding_only = protein_coding_only
         self.cell_restrictions = cell_restrictions
+        self.group_balancing = group_balancing
+        self.mixup = mixup
         self._get_cell_prop_info()
         self._get_batch_prop_info()
+
 
     def _get_batch_prop_info(self):
 
         metadata = pickle.load(open(self.metadata_path, "rb"))
+
+        metadata["obs"]["apoe"] = np.zeros_like(metadata["obs"]["ApoE_gt"])
+        idx = np.where(metadata["obs"]["ApoE_gt"] == 44)[0]
+        metadata["obs"]["apoe"][idx] = 2
+        idx = np.where((metadata["obs"]["ApoE_gt"] == 24) + (metadata["obs"]["ApoE_gt"] == 34))[0]
+        metadata["obs"]["apoe"][idx] = 1
+        idx = np.where(np.isnan(metadata["obs"]["ApoE_gt"]))[0]
+        metadata["obs"]["apoe"][idx] = np.nan
 
         if self.batch_properties is None:
             pass
@@ -352,19 +547,16 @@ class DataModule(pl.LightningDataModule):
 
         metadata = pickle.load(open(self.metadata_path, "rb"))
 
+        metadata["obs"]["apoe"] = np.zeros_like(metadata["obs"]["ApoE_gt"])
+        idx = np.where(metadata["obs"]["ApoE_gt"] == 44)[0]
+        metadata["obs"]["apoe"][idx] = 2
+        idx = np.where((metadata["obs"]["ApoE_gt"] == 24) + (metadata["obs"]["ApoE_gt"] == 34))[0]
+        metadata["obs"]["apoe"][idx] = 1
+        idx = np.where(np.isnan(metadata["obs"]["ApoE_gt"]))[0]
+        metadata["obs"]["apoe"][idx] = np.nan
+
         # not a great place for this, but needed
         self.n_genes = len(metadata["var"]["gene_name"])
-
-        self.frequency = np.zeros((2, 4, 7), dtype=np.float32)
-        for j in range(len(metadata["obs"]["CERAD"])):
-            d = metadata["obs"]["Dementia"][j]
-            c = metadata["obs"]["CERAD"][j] - 1
-            b = metadata["obs"]["BRAAK_AD"][j]
-            if d>=0 and c>=0 and b>=0:
-                self.frequency[d,c,b] += 1
-        self.frequency /= np.mean(self.frequency)
-
-        print("FREQUENCY: ", np.mean(self.frequency), np.min(self.frequency), np.max(self.frequency))
 
         if self.n_cell_properties > 0:
 
@@ -372,14 +564,14 @@ class DataModule(pl.LightningDataModule):
                 # skip if required field are already present as this function can be called multiple
                 # times if using multiple GPUs
 
-                cell_vals = metadata["obs"][k]
+                cell_vals = np.array(metadata["obs"][k])
 
                 if "freq" in self.cell_properties[k] or "mean" in self.cell_properties[k]:
                     continue
                 if not cell_prop["discrete"]:
                     # for cell properties with continuous value, determine the mean/std for normalization
                     # remove nans, negative values, or anything else suspicious
-                    if k in ["CERAD", "BRAAK_AD"]:
+                    if k in ["CERAD", "BRAAK_AD", "BRAAK_AD5", "BRAAK_CERAD"]:
                         unique_list = np.unique(cell_vals)
                         unique_list = unique_list[unique_list > -999]
                         self.cell_properties[k]["mean"] = np.mean(unique_list)
@@ -424,10 +616,11 @@ class DataModule(pl.LightningDataModule):
             self.train_idx,
             cell_properties=self.cell_properties,
             batch_properties=self.batch_properties,
-            frequency=self.frequency,
             batch_size=self.batch_size,
             protein_coding_only=self.protein_coding_only,
             cell_restrictions=self.cell_restrictions,
+            group_balancing=self.group_balancing,
+            mixup=self.mixup,
             training=True,
         )
         self.val_dataset = SingleCellDataset(
@@ -436,11 +629,12 @@ class DataModule(pl.LightningDataModule):
             self.test_idx,
             cell_properties=self.cell_properties,
             batch_properties=self.batch_properties,
-            frequency=self.frequency,
             batch_size=self.batch_size,
             protein_coding_only=self.protein_coding_only,
             cell_restrictions=self.cell_restrictions,
             gene_idx=self.train_dataset.gene_idx,
+            group_balancing=None,
+            mixup=False,
             training=False,
         )
 

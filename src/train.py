@@ -1,5 +1,5 @@
 from typing import List
-
+import numpy as np
 import torch
 import pickle
 import pytorch_lightning as pl
@@ -8,6 +8,7 @@ from data import DataModule
 from config import dataset_cfg, model_cfg, task_cfg, trainer_cfg
 from task import LitVAE
 from networks import VAE, load_model
+from create_train_test_splits import Splits
 import gc
 
 torch.set_float32_matmul_precision('medium')
@@ -18,11 +19,15 @@ def main(train_idx: List[int], test_idx: List[int], cell_class: str):
     # Set seed
     pl.seed_everything(43)
 
+    for k, v in task_cfg.items():
+        print(f"{k}: {v}")
+
     dataset_cfg["train_idx"] = train_idx
     dataset_cfg["test_idx"] = test_idx
-    dataset_cfg["cell_restrictions"] = {"class": cell_class}
+    dataset_cfg["cell_restrictions"] = {"subclass": cell_class}
 
-    max_epochs = 100 if cell_class in ["Endo", "PC", "SMC", "VMLC"] else 25
+    max_epochs = 50 if cell_class in ["Mural", "Endo", "PC", "SMC", "VMLC", "Immune"] else 50
+
 
     # Set up data module
     dm = DataModule(**dataset_cfg)
@@ -47,9 +52,11 @@ def main(train_idx: List[int], test_idx: List[int], cell_class: str):
         accumulate_grad_batches=trainer_cfg["accumulate_grad_batches"],
         precision=trainer_cfg["precision"],
         strategy=DDPStrategy(find_unused_parameters=True) if trainer_cfg["n_devices"] > 1 else "auto",
-        limit_train_batches=1000,
-        limit_val_batches=2000,
-        check_val_every_n_epoch=1,
+        limit_train_batches=2000,
+        limit_val_batches=1000,
+        check_val_every_n_epoch=1 if cell_class in ["Endo", "PC", "SMC", "VMLC", "Immune"] else 1,
+        max_steps=40_000,
+        # callbacks=[pl.callbacks.StochasticWeightAveraging(1e-4)]
         # callbacks=[checkpoint_callback],
     )
     trainer.fit(task, dm)
@@ -58,17 +65,26 @@ def main(train_idx: List[int], test_idx: List[int], cell_class: str):
 
 if __name__ == "__main__":
 
-    splits = pickle.load(open("/home/masse/work/data/mssm_rush/train_test_splits.pkl", "rb"))
+    metadata_fn = "/home/masse/work/data/mssm_rush/metadata.pkl"
+    save_fn = "/home/masse/work/data/mssm_rush/train_test_splits.pkl"
 
-    for cell_class in [ "Immune", "Micro", "Astro", "OPC", "Endo", "PC", "SMC", "VMLC", "EN_L2_3_IT", "EN_L3_5_IT_2", "IN_SST", "IN_VIP"]:
-    #for cell_class in ["IN"]:
+    #splits = Splits(metadata_fn, save_fn)
 
-        # oct 8, 1am, immune starts at v_num 124
-        # oct 9, Micro Femal starts at v_num 175
-        # oct 11, "Immune", "Astro", "OPC", "Endo", "EN", "IN" starts at 101
+    for _ in range(1):
+        #splits.create_splits()
 
-        for split_num in range(0, 10):
-            gc.collect()
-            train_idx = splits[split_num]["train_idx"]
-            test_idx = splits[split_num]["test_idx"]
-            main(train_idx, test_idx, cell_class)
+        splits1 = pickle.load(open("/home/masse/work/data/mssm_rush/train_test_splits.pkl", "rb"))
+
+        for cell_class in ["Astro",  "Micro", "EN_L2_3_IT", "IN_SST", "OPC","Oligo",]:
+
+            for split_num in range(0, 10):
+
+                if cell_class == "Astro" and split_num < -1:
+                    continue
+
+                print(f"Cell class: {cell_class}, split number: {split_num}")
+
+                gc.collect()
+                train_idx = splits1[split_num]["train_idx"]
+                test_idx = splits1[split_num]["test_idx"]
+                main(train_idx, test_idx, cell_class)

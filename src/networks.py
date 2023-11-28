@@ -1,5 +1,5 @@
 # modified from https://github.com/tabdelaal/scVI/blob/master/scvi/models/vae.py
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -69,6 +69,8 @@ class VAE(nn.Module):
         reconstruction_loss: str = "zinb",
         latent_distribution: str = "normal",
         grouped_encoder: bool = False,
+        grad_reverse_lambda: float = 0.1,
+        grad_reverse_list: Optional[List] = None,
     ):
         super().__init__()
         self.dispersion = dispersion
@@ -125,7 +127,12 @@ class VAE(nn.Module):
             )
 
         if cell_properties is not None:
-            self.cell_decoder = CellDecoder(n_latent_cell_decoder, cell_properties, grouped=grouped_encoder)
+            self.cell_decoder = CellDecoder(
+                n_latent_cell_decoder,
+                cell_properties,
+                grad_reverse_lambda=grad_reverse_lambda,
+                grad_reverse_list=grad_reverse_list,
+            )
 
         # l encoder goes from n_input-dimensional data to 1-d library size
         self.l_encoder = Encoder(
@@ -342,11 +349,10 @@ class VAE(nn.Module):
             Normal(ql_m, torch.sqrt(ql_v)),
             Normal(local_l_mean, torch.sqrt(local_l_var)),
         ).sum(dim=1)
-        kl_divergence = kl_divergence_z
 
         reconst_loss = self.get_reconstruction_loss(x, px_rate, px_r, px_dropout)
 
-        return reconst_loss + kl_divergence_l, kl_divergence, 0.0
+        return reconst_loss + kl_divergence_l, kl_divergence_z, 0.0
 
 
 

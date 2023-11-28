@@ -5,6 +5,7 @@ import torch
 from torch import nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
+from functional import GradReverseLayer
 import numpy as np
 
 def reparameterize_gaussian(mu, var):
@@ -32,10 +33,11 @@ class ResidualLayer(nn.Module):
         super().__init__()
         self.ff0 = nn.Linear(n_in, n_hidden)
         self.ff1 = nn.Linear(n_hidden, n_in)
-        self.ln = nn.LayerNorm(n_in, elementwise_affine=False)
+        self.ln = nn.LayerNorm(n_in, elementwise_affine=True)
         self.act = nn.GELU()
         self.drop = nn.Dropout(p=float(dropout_rate))
-        self.soft = nn.Softmax(dim=-1)
+        nn.init.xavier_uniform_(self.ff0.weight, gain=0.25)
+        nn.init.xavier_uniform_(self.ff1.weight, gain=0.25)
 
     def forward(self, input: torch.Tensor):
 
@@ -81,29 +83,20 @@ class FCLayers(nn.Module):
         ]
 
         self.act = nn.GELU()
-        n = n_hidden if n_layers > 1 else n_hidden - np.sum(self.batch_dims)
-        self.ff0 = nn.Linear(n_in, n)
-        self.drop = nn.Dropout(p=float(dropout_rate))
-        self.ln = nn.LayerNorm(n, elementwise_affine=True)
-        layers_dim = [n_hidden + np.sum(self.batch_dims)] + (n_layers - 1) * [n_hidden] + [n_out]
+        layers_dim = [n_in + np.sum(self.batch_dims)] + n_layers * [n_hidden] + [n_out]
 
         layers = []
-        for n in range(n_layers - 1):
+        for n in range(n_layers):
             layers.append(nn.Linear(layers_dim[n], layers_dim[n + 1]))
             layers.append(nn.GELU())
             layers.append(nn.LayerNorm(n_hidden, elementwise_affine=True))
             layers.append(nn.Dropout(p=float(dropout_rate)))
-            #layers.append(ResidualLayer(n_hidden, 2 * n_hidden, dropout_rate=dropout_rate))
+        # layers.append(ResidualLayer(n_hidden, n_hidden, dropout_rate=dropout_rate))
 
         self.fc_layers = nn.Sequential(*layers)
 
 
     def forward(self, x: torch.Tensor, batch_vals: torch.Tensor, batch_mask: torch.Tensor):
-
-        x = self.ff0(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.ln(x)
 
         if np.sum(self.batch_dims) > 0:
             batch_vals[batch_vals < 0] = 0
@@ -221,10 +214,8 @@ class Encoder(nn.Module):
 
     def forward(self, x: torch.Tensor, batch_labels: torch.Tensor, batch_mask: torch.Tensor):
 
-        x = x - x.mean(dim=-1, keepdim=True)
-        x = self.drop(x)   # 0.54 is the approximate mean of x
-        #x = self.bn(x)
-        #x = self.drop(x)
+        x = x / x.mean(dim=-1, keepdim=True) - 1.0
+        x = self.drop(x)
         # Parameters for latent distribution
         q = self.encoder(x, batch_labels, batch_mask)
         q_m = self.mean_encoder(q)
@@ -239,22 +230,31 @@ class CellDecoder(nn.Module):
         self,
         latent_dim: int,
         cell_properties: Dict[str, Any],
-        grouped: bool = False,
-        subject_batch_size: int =1,
+        grad_reverse_lambda: float = 0.10,
+        grad_reverse_list: Optional[List] = None,
     ):
         super().__init__()
 
         self.latent_dim = latent_dim
         self.cell_properties = cell_properties
-        self.grouped = grouped
-        self.subject_batch_size = subject_batch_size
         self.cell_mlp = nn.ModuleDict()
+
+        print(f"grad_reverse_lambda: {grad_reverse_lambda}")
+        self.grad_reverse = GradReverseLayer(grad_reverse_lambda)
+        self.grad_reverse_list = grad_reverse_list
 
         for k, cell_prop in cell_properties.items():
             # the output size of the cell property prediction MLP will be 1 if the property is continuous;
             # if it is discrete, then it will be the length of the possible values
             n_targets = 1 if not cell_prop["discrete"] else len(cell_prop["values"])
+            """
             self.cell_mlp[k] = nn.Linear(latent_dim, n_targets, bias=True)
+            """
+            self.cell_mlp[k] = nn.Sequential(
+                nn.Linear(latent_dim, 2 * latent_dim),
+                nn.GELU(),
+                nn.Linear(2 * latent_dim, n_targets),
+            )
 
 
     def forward(self, latent: torch.Tensor):
@@ -262,10 +262,10 @@ class CellDecoder(nn.Module):
         # Predict cell properties
         output = {}
         for n, (k, cell_prop) in enumerate(self.cell_properties.items()):
-            u = latent[:, n * self.latent_dim: (n + 1) * self.latent_dim] if self.grouped else latent
-            x = u.detach() if cell_prop["stop_grad"] else u
-            if self.subject_batch_size > 1:
-                x = torch.reshape(x, (-1, 8, x.size()[-1])).mean(dim=1)
+            if k in self.grad_reverse_list:
+                x = self.grad_reverse(latent)
+            else:
+                x = latent.detach() if cell_prop["stop_grad"] else latent
 
             output[k] = self.cell_mlp[k](x)
 
