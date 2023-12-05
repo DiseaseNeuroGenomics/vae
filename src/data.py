@@ -14,6 +14,7 @@ from torch.utils.data import (
 )
 
 
+
 class SingleCellDataset(Dataset):
     def __init__(
         self,
@@ -87,7 +88,9 @@ class SingleCellDataset(Dataset):
             self.n_genes = len(self.gene_idx )
         self._get_cell_prop_vals()
         self._get_batch_prop_vals()
-        # self.bins = [0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 11, 13, 16, 22, 35, 55, 9999]
+
+        # can remove
+        self.metadata = None
 
     def __len__(self):
         return self.n_samples
@@ -263,7 +266,8 @@ class SingleCellDataset(Dataset):
             # cond *= self.metadata["var"]['mean_expression'] < 99999
             # cond *= ~self.metadata["var"]["ribosomal"]
             # cond *= ~self.metadata["var"]["mitochondrial"]
-            # cond *= self.metadata["var"]['gene_chrom'] != "X"
+            #cond *= self.metadata["var"]['gene_chrom'] != "X"
+            #cond *= self.metadata["var"]['gene_chrom'] != "Y"
             # cond *= self.metadata["var"]['protein_coding']
 
             self.gene_idx = np.where(cond)[0]

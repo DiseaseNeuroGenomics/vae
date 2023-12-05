@@ -300,9 +300,8 @@ class LitVAE(pl.LightningModule):
         src = "/home/masse/work/vae/src/config.py"
         shutil.copyfile(src, f"{self.trainer.log_dir}/lightning_logs/version_{v}/config.py")
 
-
-        if self.current_epoch >= self.trainer.max_epochs - 4:
-            fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results_ep{self.current_epoch}.pkl"
+        if self.current_epoch == 19 or self.current_epoch == 29:
+            fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results_ep{self.current_epoch+1}.pkl"
             pickle.dump(self.results, open(fn, "wb"))
 
 

@@ -26,7 +26,7 @@ def main(train_idx: List[int], test_idx: List[int], cell_class: str):
     dataset_cfg["test_idx"] = test_idx
     dataset_cfg["cell_restrictions"] = {"subclass": cell_class}
 
-    max_epochs = 50 if cell_class in ["Mural", "Endo", "PC", "SMC", "VMLC", "Immune"] else 50
+    max_epochs = 40 if cell_class in ["Mural", "Endo", "PC", "SMC", "VMLC", "Immune"] else 20
 
 
     # Set up data module
@@ -75,11 +75,11 @@ if __name__ == "__main__":
 
         splits1 = pickle.load(open("/home/masse/work/data/mssm_rush/train_test_splits.pkl", "rb"))
 
-        for cell_class in ["Astro",  "Micro", "EN_L2_3_IT", "IN_SST", "OPC","Oligo",]:
+        for cell_class in [ "Oligo", "OPC", "IN_VIP", "EN_L3_5_IT_2"]:
 
             for split_num in range(0, 10):
 
-                if cell_class == "Astro" and split_num < -1:
+                if cell_class == "Oligo" and split_num < 4:
                     continue
 
                 print(f"Cell class: {cell_class}, split number: {split_num}")

@@ -41,7 +41,7 @@ class ModelResults:
         self.convert_apoe()
         self.process_subclasses = process_subclasses
         self.obs_list = ["AD", "Dementia", "Dementia_graded", "CERAD", "BRAAK_AD"]
-        self.obs_list = ["Dementia", "CERAD", "BRAAK_AD"]
+        self.obs_list = ["AD", "Dementia", "CERAD", "BRAAK_AD", "Age"]
         # self.obs_list = ["Age"]
         self.n_genes = len(self.meta["var"]["gene_name"])
         self.gene_names = self.meta["var"]["gene_name"]
@@ -74,6 +74,7 @@ class ModelResults:
         #adata = self.add_gene_scores_pxr(adata, model_versions)
         adata = self.add_gene_scores(adata)
         #adata = self.dementia_time_course(adata)
+        #adata = self.add_gene_scores_dual(adata)
         # adata = self.bootstrap_dementia(adata)
         #adata = self.add_braak_gene_scores(adata)
 
@@ -83,7 +84,7 @@ class ModelResults:
     def normalize_data(x):
         # no normalization allows one to trest results as Poisson -> mean = variance -> supposedly better results
         x = np.float32(x)
-        # x = 10_000 * x / np.sum(x)
+        x = 10_000 * x / np.sum(x)
         # x = np.log1p(x)
         return x
 
@@ -138,22 +139,18 @@ class ModelResults:
         for n, v in enumerate(model_versions):
             fn = f"{self.base_path}/version_{v}/test_results.pkl"
             z = pickle.load(open(fn, "rb"))
-            """
-            fn = f"{self.base_path}/version_{v}/test_results_ep20.pkl"
-            z0 = pickle.load(open(fn, "rb"))
-            for k in self.obs_list:
-                z[f"pred_{k}"] = (z[f"pred_{k}"] + z0[f"pred_{k}"]) / 2
-            """
 
             """
-            for ep in [20, 21, 22, 23, 24]:
+            for ep in [16, 17, 18, 19]:
                 fn = f"{self.base_path}/version_{v}/test_results_ep{ep}.pkl"
                 z1 = pickle.load(open(fn, "rb"))
                 for k in self.obs_list:
                     z[f"pred_{k}"] += z1[f"pred_{k}"]
                     #z[f"{k}"] += z1[f"{k}"]
+            for k in self.obs_list:
+                z[f"pred_{k}"] /= 5.0
             
-
+            
             for k in self.obs_list:
                 z[f"pred_{k}"] /= 6.0
                 if k == "BRAAK_AD":
@@ -314,14 +311,13 @@ class ModelResults:
 
         for n in range(n_bins):
             idx = np.where(idx_min == n)[0]
-            adata.uns["dementia_exp_var"][n] = explained_var(
-                adata.obs[f"pred_Dementia_graded"][idx], adata.obs[f"Dementia_graded"][idx]
-            )
-            """
+            #adata.uns["dementia_exp_var"][n] = explained_var(
+            #    adata.obs[f"pred_Dementia_graded"][idx], adata.obs[f"Dementia_graded"][idx]
+            #)
+
             adata.uns["dementia_accuracy"][n] = classification_score(
                 adata.obs[f"pred_Dementia"][idx], adata.obs[f"Dementia"][idx]
             )
-            """
 
 
         return adata
@@ -384,8 +380,40 @@ class ModelResults:
 
         return self.add_gene_scores(adata0)
 
+    def add_gene_scores_dual(self, adata, n_bins=10):
+
+        counts = np.zeros((n_bins, n_bins), dtype=np.float32)
+        scores = np.zeros((self.n_genes, n_bins, n_bins), dtype=np.float32)
+
+        for n, i in enumerate(adata.obs["cell_idx"]):
+
+            data = np.memmap(
+                self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
+            ).astype(np.float32)
+
+            v0 = adata.obs[f"pred_Dementia"][n]
+            v1 = adata.obs[f"pred_BRAAK_AD"][n]
+
+            if np.isnan(v0) or np.isnan(v1):
+                continue
+            else:
+                bin0 = np.argmin((v0 - adata.uns[f"percentiles_Dementia"]) ** 2)
+                bin1 = np.argmin((v1 - adata.uns[f"percentiles_BRAAK_AD"]) ** 2)
+                counts[bin0, bin1] += 1
+                scores[:, bin0, bin1] += self.normalize_data(data)
+
+        adata.uns["scores_Dm_BRAAK" ] = scores / counts[None, :, :]
+
+        return adata
+
 
     def add_gene_scores(self, adata, n_bins=20):
+
+        k = "BRAAK_Dementia"
+        self.obs_list += [k]
+        adata.obs[f"pred_{k}"] = (
+            adata.obs["pred_BRAAK_AD"] / np.std(adata.obs["pred_BRAAK_AD"]) + adata.obs["pred_Dementia"] / np.std(adata.obs["pred_Dementia"])
+        )
 
         percentiles = {}
         for k in self.obs_list:
@@ -434,6 +462,8 @@ class ModelResults:
 
             for k in self.obs_list:
                 adata.uns[f"percentiles_{k}"] = percentiles[k]
+
+        self.obs_list = self.obs_list[:-1]
 
         return adata
 
