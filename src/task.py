@@ -266,18 +266,10 @@ class LitVAE(pl.LightningModule):
 
     def on_validation_epoch_end(self):
 
-
-        new_val_score = 0.0
-        for k in self.cell_explained_var.keys():
-            new_val_score += self.cell_explained_var[k].compute()
-        for k in self.cell_accuracy.keys():
-            new_val_score += self.cell_accuracy[k].compute()
-
-        self.log("val_score", new_val_score, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
-
         for k in self.cell_properties.keys():
-            self.results[k] = np.concatenate(self.results[k], axis=0)
-            self.results["pred_" + k] = np.concatenate(self.results["pred_" + k], axis=0)
+            if len(self.results[k]) > 0:
+                self.results[k] = np.concatenate(self.results[k], axis=0)
+                self.results["pred_" + k] = np.concatenate(self.results["pred_" + k], axis=0)
         if self.batch_properties is not None:
             for k in self.batch_properties.keys():
                 self.results[k] = np.concatenate(self.results[k], axis=0)
@@ -300,9 +292,11 @@ class LitVAE(pl.LightningModule):
         src = "/home/masse/work/vae/src/config.py"
         shutil.copyfile(src, f"{self.trainer.log_dir}/lightning_logs/version_{v}/config.py")
 
+
         if self.current_epoch == 19 or self.current_epoch == 29:
             fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results_ep{self.current_epoch+1}.pkl"
             pickle.dump(self.results, open(fn, "wb"))
+
 
 
         self.results["epoch"] = self.current_epoch + 1
@@ -336,8 +330,9 @@ class LitVAE(pl.LightningModule):
                     targets = cell_targets[:, n].to(torch.int64)
 
                 self.cell_accuracy[k].update(pred_idx[idx][None, :], targets[idx][None, :])
-                self.results[k].append(targets.detach().cpu().numpy())
-                self.results["pred_" + k].append(pred_prob)
+                if k != "SubID": # to save space
+                    self.results[k].append(targets.detach().cpu().numpy())
+                    self.results["pred_" + k].append(pred_prob)
             else:
                 pred = torch.squeeze(cell_pred[k])
                 if self.subject_batch_size > 1:
