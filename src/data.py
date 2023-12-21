@@ -219,7 +219,8 @@ class SingleCellDataset(Dataset):
         cond[self.cell_idx] = 1
 
         if not self.training:
-            cond *= self.metadata["obs"]["include_analysis"] == 1
+            # cond *= self.metadata["obs"]["include_analysis"] == 1
+            cond *= self.metadata["obs"]["include_training"] == 1
         else:
             cond *= self.metadata["obs"]["include_training"] == 1
             # cond *= self.metadata["obs"]["include_analysis"] == 1
@@ -266,8 +267,8 @@ class SingleCellDataset(Dataset):
             # cond *= self.metadata["var"]['mean_expression'] < 99999
             # cond *= ~self.metadata["var"]["ribosomal"]
             # cond *= ~self.metadata["var"]["mitochondrial"]
-            #cond *= self.metadata["var"]['gene_chrom'] != "X"
-            #cond *= self.metadata["var"]['gene_chrom'] != "Y"
+            cond *= self.metadata["var"]['gene_chrom'] != "X"
+            cond *= self.metadata["var"]['gene_chrom'] != "Y"
             # cond *= self.metadata["var"]['protein_coding']
 
             self.gene_idx = np.where(cond)[0]
