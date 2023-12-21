@@ -3,6 +3,7 @@ import pickle
 import pandas as pd
 import numpy as np
 import anndata as ad
+import scipy.stats as stats
 import matplotlib.pyplot as plt
 
 
@@ -30,7 +31,9 @@ class ModelResults:
             self,
             base_path: str = "/home/masse/work/vae/src/lightning_logs",
             data_fn: str = "/home/masse/work/data/mssm_rush/data.dat",
-            meta_fn: str = "/home/masse/work/data/mssm_rush/metadata.pkl",
+            meta_fn: str = "/home/masse/work/data/mssm_rush/metadata_slim.pkl",
+            gene_pathway_fn: str = "gene_pathways.pkl",
+            curated_pathways_fn: str = "ad_related_go_bp_pathways_1220.csv",
             latent_dim: int = 32,
             process_subclasses: bool = False,
     ):
@@ -38,17 +41,24 @@ class ModelResults:
         self.base_path = base_path
         self.data_fn = data_fn
         self.meta = pickle.load(open(meta_fn, "rb"))
+        self.gene_pathways = pickle.load(open(gene_pathway_fn, "rb"))
+        self.curated_pathways = pd.read_csv(curated_pathways_fn)
         self.convert_apoe()
         self.process_subclasses = process_subclasses
-        self.obs_list = ["AD", "Dementia", "Dementia_graded", "CERAD", "BRAAK_AD"]
-        self.obs_list = ["AD", "Dementia", "CERAD", "BRAAK_AD", "Age"]
-        # self.obs_list = ["Age"]
+        #self.obs_list = ["Dementia",  "BRAAK_AD"]
+        self.obs_list = ["Dementia", "CERAD", "BRAAK_AD", "Dementia_graded"]
         self.n_genes = len(self.meta["var"]["gene_name"])
         self.gene_names = self.meta["var"]["gene_name"]
         self.latent_dim = latent_dim
         self.extra_obs = [
             "barcode", "Dementia", "MCI", "Sex", "apoe", "Age", "r03_r04", "ethnicity",
             "ApoE_gt", "Brain_bank", "SCZ", "SubID", "subclass", "PMI", "Vascular", "ALS",
+            "include_analysis",
+        ]
+        self.extra_obs = [
+            "Sex", "apoe", "Age",
+            "ApoE_gt", "Brain_bank",
+            "include_analysis",
         ]
         """
         self.extra_obs = [
@@ -57,18 +67,19 @@ class ModelResults:
         ]
         """
 
-    def create_data(self, model_versions):
+        self.get_gene_idx()
 
-        index, cell_class, cell_subclasses = self.get_cell_index(model_versions)
-        print(f"Subclasses present: {cell_subclasses}")
-        assert len(cell_class) == 1, "Multiple cell classes detected!"
-        cell_class = cell_class[0]
+    def create_data(self, model_versions, subclass=None):
 
-        adata = self.create_base_anndata(model_versions)
-        """
-        idx = np.where(adata.obs["apoe"].values == 0)[0]
-        adata = adata[idx]
-        """
+        if subclass is None:
+            index, cell_class, cell_subclasses = self.get_cell_index(model_versions)
+            print(f"Subclasses present: {cell_subclasses}")
+            print(cell_subclasses)
+            assert len(cell_class) == 1, "Multiple cell classes detected!"
+
+
+        adata = self.create_base_anndata(model_versions, subclass=subclass)
+
 
         #adata = self.add_gene_scores_subject(adata)
         #adata = self.add_gene_scores_pxr(adata, model_versions)
@@ -77,6 +88,8 @@ class ModelResults:
         #adata = self.add_gene_scores_dual(adata)
         # adata = self.bootstrap_dementia(adata)
         #adata = self.add_braak_gene_scores(adata)
+
+        adata = self.add_pathway_means_correlations(adata)
 
         return adata
 
@@ -120,6 +133,7 @@ class ModelResults:
             a.obs[k][idx] = np.nan
             if z[f"pred_{k}"].ndim == 2:
                 probs = z[f"pred_{k}"]
+                #print(k, probs.shape)
                 # a.obs[f"pred_{k}"] = z[f"pred_{k}"][:, -1]
                 a.obs[f"pred_{k}"] = self.weight_probs(probs, k)
             else:
@@ -132,9 +146,13 @@ class ModelResults:
                 idx = np.where(a.obs[k] < -99)[0]
                 a.obs[k][idx] = np.nan
 
+
+        # Only include samples with include_analysis=True
+        # a = a[a.obs["include_analysis"] > 0]
+
         return a
 
-    def create_base_anndata(self, model_versions):
+    def create_base_anndata(self, model_versions, subclass=None):
 
         for n, v in enumerate(model_versions):
             fn = f"{self.base_path}/version_{v}/test_results.pkl"
@@ -167,6 +185,9 @@ class ModelResults:
                 adata = a.copy()
             else:
                 adata = ad.concat((adata, a), axis=0)
+
+        if subclass is not None:
+            adata = adata[adata.obs.subclass == subclass]
 
         return adata
 
@@ -407,17 +428,17 @@ class ModelResults:
         return adata
 
 
-    def add_gene_scores(self, adata, n_bins=20):
+    def add_gene_scores(self, adata, n_bins=100):
 
-        k = "BRAAK_Dementia"
+        k = "BRAAK_CERAD"
         self.obs_list += [k]
         adata.obs[f"pred_{k}"] = (
-            adata.obs["pred_BRAAK_AD"] / np.std(adata.obs["pred_BRAAK_AD"]) + adata.obs["pred_Dementia"] / np.std(adata.obs["pred_Dementia"])
+            adata.obs["pred_BRAAK_AD"] / np.std(adata.obs["pred_BRAAK_AD"]) + adata.obs["pred_CERAD"] / np.std(adata.obs["pred_CERAD"])
         )
 
         percentiles = {}
         for k in self.obs_list:
-            percentiles[k] = np.percentile(adata.obs[f"pred_{k}"], np.arange(2.5, 100.5, 5.0))
+            percentiles[k] = np.percentile(adata.obs[f"pred_{k}"], np.arange(0.5, 100.5, 1.0))
 
         conds = [None,  {"Dementia": 0}, {"Dementia": 1}, {"Sex": "Male"}, {"Sex": "Female"}, {"apoe": 0}, {"apoe": 1}, {"apoe": 2}]
         score_names = ["", "_Dm0", "_Dm1", "_Male", "_Female", "_apoe0", "_apoe1", "_apoe2"]
@@ -467,77 +488,76 @@ class ModelResults:
 
         return adata
 
-    def add_vascular_gene_scores(self, adata, n_bins=100):
+    def get_gene_idx(self):
 
-        un_cerad = np.unique(adata.obs.CERAD)
-        un_braak = np.unique(adata.obs.BRAAK_AD)
+        self.gene_idx = {}
+        self.pathway_names = []
+        for go_id, path_name in zip(self.curated_pathways.go_id.values, self.curated_pathways.pathway.values):
+            genes_in_go_path = self.gene_pathways[go_id]
+            self.pathway_names.append(path_name)
+            self.gene_idx[go_id] = []
+            for g in genes_in_go_path:
+                idx = np.where(self.gene_names == g)[0]
+                if len(idx) > 0:
+                    self.gene_idx[go_id].append(idx[0])
+            self.gene_idx[go_id] = np.stack(self.gene_idx[go_id])
 
-        a0 = adata[adata.obs.Vascular == 0]
-        a0 = a0[a0.obs.BRAAK_AD <= un_cerad[0]]
+        print("GENE iDX")
+        c = 0
+        for k, v in self.gene_idx.items():
+            print(k, v)
+            c += 1
+            if c > 3:
+                break
 
-        a1 = adata[adata.obs.Vascular == 1]
-        a1 = a1[a1.obs.BRAAK_AD <= un_cerad[0]]
 
-        counts = {k: 0.0 for k in ["Vasc0", "Vasc1"]}
-        scores = {k: np.zeros((self.n_genes), dtype=np.float32) for k in ["Vasc0", "Vasc1"]}
+    def add_pathway_means_correlations(self, adata, n_bins=100, gene_threshold=0.1):
 
-        for n, i in enumerate(a0.obs["cell_idx"]):
+        for k in ["BRAAK_AD", "Dementia"]:
 
-            data = np.memmap(
-                self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
-            ).astype(np.float32)
+            v = np.reshape(np.array(adata.obs[f"pred_{k}"]), (-1, 1))
+            pct = np.reshape(np.array(adata.uns[f"percentiles_{k}"]), (1, -1))
+            n_pathways = len(self.curated_pathways)
 
-            counts["Vasc0"] += 1
-            scores["Vasc0"] += data
+            mean_gene_vals = np.mean(adata.uns[f"scores"][k], axis=1)
+            # we will mask out any genes with low expression
+            mask_genes = np.ones_like(mean_gene_vals)
+            mask_genes[mean_gene_vals < gene_threshold] = 0.0
 
-        for n, i in enumerate(a1.obs["cell_idx"]):
-            data = np.memmap(
-                self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
-            ).astype(np.float32)
+            print("MEAN GENE VALS", mean_gene_vals.shape)
 
-            counts["Vasc1"] += 1
-            scores["Vasc1"] += data
+            adata.uns[f"pathway_mean_{k}"] = np.zeros((n_pathways, n_bins), dtype = np.float32)
+            adata.uns[f"pathway_corr_{k}"] = np.zeros((n_pathways, n_pathways, n_bins), dtype=np.float32)
+            adata.uns["pathway_names"] = self.pathway_names
 
-        for k in scores.keys():
-            scores[k] /= counts[k]
-            adata.uns[k] = scores[k]
+            d = np.abs(v - pct)
+            bin_idx = np.argmin(d, axis = 1)
 
-        return adata
+            for b in range(n_bins):
+                idx = np.array(adata.obs["cell_idx"])[bin_idx == b]
+                go_scores = []
 
-    def add_braak_gene_scores(self, adata, n_bins=100):
+                for _, i in enumerate(idx):
+                    data = np.memmap(
+                        self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
+                    ).astype(np.float32)
 
-        un_cerad = np.unique(adata.obs.CERAD)
-        un_braak = np.unique(adata.obs.BRAAK_AD)
+                    data = self.normalize_data(data)
 
-        a0 = adata[adata.obs.BRAAK_AD == un_cerad[0]]
-        a0 = a0[a0.obs.Vascular == 0]
+                    go_scores_cell = []
+                    for go_id, go_idx in self.gene_idx.items():
+                        v = mask_genes[go_idx] * data[go_idx] / mean_gene_vals[go_idx]
+                        go_scores_cell.append(np.mean(v))
+                    go_scores.append(np.stack(go_scores_cell, axis=0))
 
-        a1 = adata[adata.obs.BRAAK_AD == un_cerad[1]]
-        a1 = a1[a1.obs.Vascular == 0]
+                go_scores = np.stack(go_scores, axis=0)
 
-        counts = {k: 0.0 for k in ["Braak0", "Braak1"]}
-        scores = {k: np.zeros((self.n_genes), dtype=np.float32) for k in ["Braak0", "Braak1"]}
-
-        for n, i in enumerate(a0.obs["cell_idx"]):
-
-            data = np.memmap(
-                self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
-            ).astype(np.float32)
-
-            counts["Braak0"] += 1
-            scores["Braak0"] += data
-
-        for n, i in enumerate(a1.obs["cell_idx"]):
-            data = np.memmap(
-                self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
-            ).astype(np.float32)
-
-            counts["Braak1"] += 1
-            scores["Braak1"] += data
-
-        for k in scores.keys():
-            scores[k] /= counts[k]
-            adata.uns[k] = scores[k]
+                for n0 in range(n_pathways):
+                    adata.uns[f"pathway_mean_{k}"][n0, b] = np.mean(go_scores[:, n0])
+                    for n1 in range(n_pathways):
+                        adata.uns[f"pathway_corr_{k}"][n0, n1, b], _ = stats.pearsonr(go_scores[:, n0], go_scores[:, n1])
 
         return adata
+
+
 
