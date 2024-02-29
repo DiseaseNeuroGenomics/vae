@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, List, Optional
 
 import shutil
@@ -37,14 +38,15 @@ class LitVAE(pl.LightningModule):
         latent_distribution: str = "normal",
         n_epochs_kl_warmup: Optional[int] = 20,
         learning_rate: float = 0.0005,
+        warmup_steps: float = 2000.0,
         weight_decay: float = 0.1,
         l1_lambda: float = 0.0,
         gene_loss_coeff: float = 5e-4,
-        save_gene_vals: bool = True,
+        save_gene_vals: bool = False,
         library_mean: Optional[float] = None,
         library_var: Optional[float] = None,
         subject_batch_size: int = 1,
-        use_gdro: bool = True,
+        use_gdro: bool = False,
 
     ):
         super().__init__()
@@ -58,6 +60,7 @@ class LitVAE(pl.LightningModule):
         self.latent_distribution = latent_distribution
         self.n_epochs_kl_warmup = n_epochs_kl_warmup
         self.learning_rate = learning_rate
+        self.warmup_steps = warmup_steps
         self.weight_decay = weight_decay
         self.l1_lambda = l1_lambda
         self.gene_loss_coeff = gene_loss_coeff
@@ -76,6 +79,7 @@ class LitVAE(pl.LightningModule):
 
         self.val_score = -999.0
         self.train_step = 0
+        self.source_code_copied = False
 
         self.use_gdro = use_gdro
         if use_gdro:
@@ -193,7 +197,7 @@ class LitVAE(pl.LightningModule):
 
         recon_loss = self.get_reconstruction_loss(x, px_rate, px_r, px_dropout)
 
-        loss = self.kl_weight * (recon_loss + kl_l + 1.0 * kl_z).mean()
+        loss = recon_loss.mean() + self.kl_weight * (kl_l +  kl_z).mean()
 
         if training:
             self.log("recon_loss", recon_loss.mean(), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
@@ -264,6 +268,23 @@ class LitVAE(pl.LightningModule):
             for n, k in enumerate(self.batch_properties.keys()):
                 self.results[k].append(batch_labels[:, n].detach().cpu().numpy())
 
+    def copy_source_code(self, version_num):
+
+        target_dir = f"{self.trainer.log_dir}/lightning_logs/version_{version_num}/code"
+        os.mkdir(target_dir)
+        src_files = [
+            "/home/masse/work/vae/src/config.py",
+            "/home/masse/work/vae/src/data.py",
+            "/home/masse/work/vae/src/modules.py",
+            "/home/masse/work/vae/src/networks.py",
+            "/home/masse/work/vae/src/task.py",
+            "/home/masse/work/vae/src/train.py",
+            "/home/masse/work/vae/src/losses.py",
+        ]
+        for src in src_files:
+            shutil.copyfile(src, f"{target_dir}/{os.path.basename(src)}")
+        self.source_code_copied = True
+
     def on_validation_epoch_end(self):
 
         for k in self.cell_properties.keys():
@@ -285,19 +306,16 @@ class LitVAE(pl.LightningModule):
             r, p = stats.pearsonr(x0[idx], x1[idx])
             self.log("corr", r, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
-
         v = self.trainer.logger.version
+        if not self.source_code_copied:
+            self.copy_source_code(v)
+
         fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results.pkl"
         pickle.dump(self.results, open(fn, "wb"))
-        src = "/home/masse/work/vae/src/config.py"
-        shutil.copyfile(src, f"{self.trainer.log_dir}/lightning_logs/version_{v}/config.py")
 
-
-        if self.current_epoch == 19 or self.current_epoch == 29:
+        if self.current_epoch == 2 or self.current_epoch == 4:
             fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results_ep{self.current_epoch+1}.pkl"
             pickle.dump(self.results, open(fn, "wb"))
-
-
 
         self.results["epoch"] = self.current_epoch + 1
         for k in self.cell_properties.keys():
@@ -334,7 +352,14 @@ class LitVAE(pl.LightningModule):
                     self.results[k].append(targets.detach().cpu().numpy())
                     self.results["pred_" + k].append(pred_prob)
             else:
+
                 pred = torch.squeeze(cell_pred[k])
+                """
+                if len(idx) > 1:
+                    pred = torch.squeeze(cell_pred[k])
+                else:
+                    pred = cell_pred[k][0]
+                """
                 if self.subject_batch_size > 1:
                     targets = torch.reshape(cell_targets[:, n], (-1, self.subject_batch_size)).mean(dim=1)
                     targets = targets[idx]
@@ -344,7 +369,9 @@ class LitVAE(pl.LightningModule):
 
                 self.results[k].append(cell_targets[:, n].detach().cpu().numpy())
                 self.results["pred_" + k].append(pred.detach().cpu().to(torch.float32).numpy())
-        self.results["latent"].append(latent_mean.detach().cpu().to(torch.float32).numpy())
+
+        if latent_mean is not None:
+            self.results["latent"].append(latent_mean.detach().cpu().to(torch.float32).numpy())
         self.results["cell_mask"].append(cell_mask.detach().cpu().to(torch.float32).numpy())
 
         for k, v in self.cell_accuracy.items():
@@ -383,6 +410,13 @@ class LitVAE(pl.LightningModule):
 
             if self.use_gdro and k in self.gdro.keys():
                 self.gdro[k].update_weights()
+
+        """
+        v = torch.hstack((cell_pred["BRAAK_AD"][:, 0:1], cell_pred["Dementia"][:, 1:2]))
+        r = torch.corrcoef(torch.transpose(v, 1, 0))
+        cell_loss += 10000000.0 * r[0, 1]
+        """
+
 
         return cell_loss
 
@@ -431,11 +465,9 @@ class LitVAE(pl.LightningModule):
                     l1_regularization += torch.norm(param, p=1)
             loss += self.l1_lambda * l1_regularization
 
-
         self.log("gene_loss", gene_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("cell_loss", cell_loss, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-        self.log("kl_weight", self.kl_weight, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-
+        self.log("kl_weight", self.kl_weight, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
 
         return loss
 
@@ -492,7 +524,7 @@ class LitVAE(pl.LightningModule):
 
         # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=3, verbose=True)
         lr_scheduler = {
-            'scheduler': WarmupConstantAndDecaySchedule(opt, warmup_steps=1000),
+            'scheduler': WarmupConstantAndDecaySchedule(opt, warmup_steps=self.warmup_steps),
             'interval': 'step',
         }
 
@@ -501,6 +533,101 @@ class LitVAE(pl.LightningModule):
            'lr_scheduler': lr_scheduler, # Changed scheduler to lr_scheduler
            'interval': 'step',
        }
+
+
+class Pathways(LitVAE):
+
+    def __init__(
+        self,
+        network,
+        cell_properties: Optional[Dict[str, Any]] = None,
+        batch_properties: Optional[Dict[str, Any]] = None,
+        learning_rate: float = 0.0005,
+        warmup_steps: float = 2000.0,
+        weight_decay: float = 0.0,
+        l1_lambda: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__(
+            network,
+            cell_properties=cell_properties,
+            learning_rate=learning_rate,
+            warmup_steps=warmup_steps,
+            weight_decay=weight_decay,
+        )
+
+        self.network = network
+        self.cell_properties = cell_properties
+        self.batch_properties = batch_properties
+        self.learning_rate = learning_rate
+        self.warmup_steps = warmup_steps
+        self.weight_decay = weight_decay
+        self.l1_lambda = l1_lambda
+
+        print(f"Learning rate: {self.learning_rate}")
+        print(f"Weight decay: {self.weight_decay}")
+
+        self._cell_properties_metrics()
+        self._create_results_dict()
+
+        self.val_score = -999.0
+        self.train_step = 0
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.network.parameters(), lr=self.learning_rate)
+
+    def validation_step(self, batch, batch_idx):
+
+        gene_vals, cell_targets, cell_mask, batch_labels, batch_mask, cell_idx, _ = batch
+        cell_pred = self.network(gene_vals, batch_labels, batch_mask)
+        self.results["cell_idx"].append(cell_idx.detach().cpu().numpy())
+        self.cell_scores(cell_pred, cell_targets, cell_mask, None)
+
+    def _cell_loss(
+            self,
+            cell_pred: Dict[str, torch.Tensor],
+            cell_prop_vals: torch.Tensor,
+            cell_mask: torch.Tensor,
+            group_idx: torch.Tensor,
+    ):
+
+        cell_loss = 0.0
+
+        for n, (k, cell_prop) in enumerate(self.cell_properties.items()):
+
+            if cell_prop["discrete"]:
+                loss = self.cell_cross_ent[k](cell_pred[k], cell_prop_vals[:, n].to(torch.int64))
+                cell_loss += (loss * cell_mask[:, n]).mean()
+
+            else:
+                loss = self.cell_mse[k](torch.squeeze(cell_pred[k]), cell_prop_vals[:, n])
+                cell_loss += (loss * cell_mask[:, n]).mean()
+
+        return cell_loss
+
+    def training_step(self, batch, batch_idx):
+
+        self.train_step += 1
+
+        gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, _, group_idx = batch
+        cell_pred = self.network(gene_vals, batch_labels, batch_mask)
+
+        cell_loss = 0.0
+
+        for n, (k, cell_prop) in enumerate(self.cell_properties.items()):
+
+            if cell_prop["discrete"]:
+                loss = self.cell_cross_ent[k](cell_pred[k], cell_prop_vals[:, n].to(torch.int64))
+                cell_loss += (loss * cell_mask[:, n]).mean()
+            else:
+                loss = self.cell_mse[k](torch.squeeze(cell_pred[k]), cell_prop_vals[:, n])
+                cell_loss += (loss * cell_mask[:, n]).mean()
+
+        self.log("cell_loss", cell_loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
+
+        return cell_loss
+
+
 
 class WarmupConstantAndDecaySchedule(LambdaLR):
     """ Linear warmup and then constant.
