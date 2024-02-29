@@ -1,6 +1,7 @@
 # modified from https://github.com/tabdelaal/scVI/blob/master/scvi/models/vae.py
 from typing import Any, Dict, List, Optional, Tuple
 
+import pickle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,7 +13,83 @@ from distributions import (
     NegativeBinomial,
     Poisson,
 )
-from modules import Encoder, GroupedEncoder, CellDecoder, DecoderSCVI, one_hot
+from modules import Encoder, GroupedEncoder, CellDecoder, DecoderSCVI, FCLayers, LinearWithMask, one_hot
+
+class PathwaysMLP(nn.Module):
+
+    def __init__(
+        self,
+        n_hidden: int = 128,
+        n_layers: int = 1,
+        gene_pathway_fn: str = "/home/masse/work/vae/go_paths/go_bp_terms_10_150_top125.pkl",
+        go_ids: Optional[List[str]] = None,
+        gene_names: Optional[List[str]] = None,
+        dropout_rate: float = 0.1,
+        input_dropout_rate: float = 0.0,
+        cell_properties: Optional[Dict[str, Any]] = None,
+        grad_reverse_dict: Optional[Dict] = None,
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.n_genes = len(gene_names)
+
+        self.drop = nn.Dropout(p=input_dropout_rate)
+        #self.bn = nn.BatchNorm1d(len(go_ids), momentum=0.05, eps=0.1)
+        self.ln = self.ln = nn.LayerNorm(len(go_ids), elementwise_affine=True)
+
+        self.ff = FCLayers(
+            len(go_ids),
+            n_layers,
+            n_hidden,
+            dropout_rate,
+            layer_norm=True,
+            batch_properties=None,
+        )
+
+        self.cell_decoder = CellDecoder(
+            n_hidden,
+            cell_properties,
+            grad_reverse_dict,
+            use_hidden_layer=False
+        )
+
+        self._create_path_matrix(gene_pathway_fn, go_ids, gene_names)
+        self.ff0 = LinearWithMask(self.n_genes, len(go_ids), self.gene_transform)
+
+    def forward(self, gene_vals, batch_labels, batch_mask):
+
+        x = torch.log(1 + gene_vals)
+        x = self.drop(x)
+        # x = gene_vals
+        # x = x @ self.gene_transform.to(device=x.device)
+        x = self.ff0(x)
+
+        #print("X", gene_vals.mean(), x.mean())
+        #x = x / x.mean(dim=-1, keepdim=True) - 1.0
+        x = self.ln(x)
+
+        x = self.ff(x, batch_labels, batch_mask)
+        return self.cell_decoder(x)
+
+    def _create_path_matrix(self, gene_pathway_fn, go_ids, gene_names):
+
+        gene_paths = pickle.load(open(gene_pathway_fn, "rb"))
+        w = np.zeros((self.n_genes, len(go_ids)), dtype=np.float32)
+        gene_names = np.array(gene_names)
+
+        for n, go in enumerate(go_ids):
+            for gene in gene_paths[go]["genes"]:
+                idx = np.where(gene_names == gene)[0]
+                if len(idx) == 0:
+                    continue
+                w[idx[0], n] = 1.0
+
+        w /= np.sum(w, axis=0, keepdims=True)
+
+        print(f"Number of elements in gene transform {np.sum(w)}")
+        self.gene_transform = torch.from_numpy(w)
+
 
 
 # VAE model
@@ -69,8 +146,8 @@ class VAE(nn.Module):
         reconstruction_loss: str = "zinb",
         latent_distribution: str = "normal",
         grouped_encoder: bool = False,
-        grad_reverse_lambda: float = 0.1,
-        grad_reverse_list: Optional[List] = None,
+        grad_reverse_dict: Optional[Dict] = None,
+        cell_decoder_hidden_layer: bool = False,
     ):
         super().__init__()
         self.dispersion = dispersion
@@ -130,8 +207,8 @@ class VAE(nn.Module):
             self.cell_decoder = CellDecoder(
                 n_latent_cell_decoder,
                 cell_properties,
-                grad_reverse_lambda=grad_reverse_lambda,
-                grad_reverse_list=grad_reverse_list,
+                grad_reverse_dict=grad_reverse_dict,
+                use_hidden_layer=cell_decoder_hidden_layer,
             )
 
         # l encoder goes from n_input-dimensional data to 1-d library size

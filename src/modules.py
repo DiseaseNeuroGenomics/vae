@@ -21,6 +21,27 @@ def one_hot(index, n_cat):
     return onehot.type(torch.float32)
 
 
+
+class LinearWithMask(nn.Module):
+
+    def __init__(self, n_input: int, n_output: int, mask:torch.Tensor):
+        super().__init__()
+        # self.ff = nn.Linear(n_input, n_output)
+        self.W = nn.parameter.Parameter(
+            data=torch.randn(n_input, n_output),
+            requires_grad=True,
+        )
+        self.b = nn.parameter.Parameter(
+            data=torch.zeros((1, n_output), dtype=torch.float32),
+            requires_grad=True,
+        )
+        self.mask = mask
+
+    def forward(self, x):
+        W = self.W * self.mask.to(x.device)
+        return x @ W + self.b
+
+
 class ResidualLayer(nn.Module):
 
     def __init__(
@@ -67,11 +88,11 @@ class FCLayers(nn.Module):
     def __init__(
         self,
         n_in: int,
-        n_out: int,
         n_layers: int = 1,
         n_hidden: int = 128,
         dropout_rate: float = 0.1,
         batch_properties: Optional[Dict[str, Any]] = None,
+        layer_norm: bool = True,
     ):
 
         # we will inject the batch variables into the first hidden layer
@@ -83,13 +104,14 @@ class FCLayers(nn.Module):
         ]
 
         self.act = nn.GELU()
-        layers_dim = [n_in + np.sum(self.batch_dims)] + n_layers * [n_hidden] + [n_out]
+        layers_dim = [n_in + np.sum(self.batch_dims)] + n_layers * [n_hidden]
 
         layers = []
         for n in range(n_layers):
             layers.append(nn.Linear(layers_dim[n], layers_dim[n + 1]))
             layers.append(nn.GELU())
-            layers.append(nn.LayerNorm(n_hidden, elementwise_affine=True))
+            if layer_norm:
+                layers.append(nn.LayerNorm(n_hidden, elementwise_affine=True))
             layers.append(nn.Dropout(p=float(dropout_rate)))
         # layers.append(ResidualLayer(n_hidden, n_hidden, dropout_rate=dropout_rate))
 
@@ -165,6 +187,28 @@ class GroupedEncoder(nn.Module):
 
         return torch.cat(q_m, dim=-1), torch.cat(q_v, dim=-1), torch.cat(latent, dim=-1)
 
+class GeneDropout(nn.Module):
+
+    def __init__(self, p: float = 0.5, alpha: float = 0.95):
+        super().__init__()
+        self.p = p
+        self.alpha = alpha
+        self.running_non_zero_means = 0.0
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p < 1e-6:
+            return input
+        else:
+            non_zero_means = (input > 0).to(torch.float32).mean(dim=0, keepdim=True)
+            self.running_non_zero_means = self.alpha * self.running_non_zero_means + (1 - self.alpha) * non_zero_means
+            p = self.p * self.running_non_zero_means / self.running_non_zero_means.mean()
+            p = torch.clip(p, 0.0, 0.9)
+            rand = torch.rand(*input.size()).to(device=input.device)
+            mask = (rand < p).to(torch.float32)
+            #print('XX', p.size(), p.mean(), mask.size(), mask.mean(), input.size(), input.mean())
+            return (input * mask) / p.mean()
+
+
 # Encoder
 class Encoder(nn.Module):
     r"""Encodes data of ``n_input`` dimensions into a latent space of ``n_output``
@@ -194,7 +238,6 @@ class Encoder(nn.Module):
         self.distribution = distribution
         self.encoder = FCLayers(
             n_in=n_input,
-            n_out=n_hidden,
             n_layers=n_layers,
             n_hidden=n_hidden,
             dropout_rate=dropout_rate,
@@ -202,20 +245,22 @@ class Encoder(nn.Module):
         )
         self.mean_encoder = nn.Linear(n_hidden, n_output)
         self.var_encoder = nn.Linear(n_hidden, n_output)
-        #self.bn = nn.BatchNorm1d(n_input, momentum=0.05, eps=1.0)
+        # self.bn = nn.BatchNorm1d(n_input, momentum=0.05, eps=10.0)
+        self.ln = nn.LayerNorm(n_input, elementwise_affine=False)
 
         if distribution == "ln":
             self.z_transformation = nn.Softmax(dim=-1)
         else:
             self.z_transformation = identity
 
-        self.drop = nn.Dropout(p=input_dropout_rate)
+        self.drop = GeneDropout(p=input_dropout_rate)
         self.softplus = nn.Softplus()
 
     def forward(self, x: torch.Tensor, batch_labels: torch.Tensor, batch_mask: torch.Tensor):
 
-        x = x / x.mean(dim=-1, keepdim=True) - 1.0
         x = self.drop(x)
+        x = x / x.mean(dim=-1, keepdim=True) - 1
+
         # Parameters for latent distribution
         q = self.encoder(x, batch_labels, batch_mask)
         q_m = self.mean_encoder(q)
@@ -230,8 +275,8 @@ class CellDecoder(nn.Module):
         self,
         latent_dim: int,
         cell_properties: Dict[str, Any],
-        grad_reverse_lambda: float = 0.10,
-        grad_reverse_list: Optional[List] = None,
+        grad_reverse_dict: Optional[Dict] = None,
+        use_hidden_layer: bool = True,
     ):
         super().__init__()
 
@@ -239,22 +284,27 @@ class CellDecoder(nn.Module):
         self.cell_properties = cell_properties
         self.cell_mlp = nn.ModuleDict()
 
-        print(f"grad_reverse_lambda: {grad_reverse_lambda}")
-        self.grad_reverse = GradReverseLayer(grad_reverse_lambda)
-        self.grad_reverse_list = grad_reverse_list
+        self.grad_reverse_dict = grad_reverse_dict
+        if grad_reverse_dict is not None:
+            self.grad_reverse = nn.ModuleDict()
+            for k, v in grad_reverse_dict.items():
+                print(f"Grad reverse {k}: {v}")
+                self.grad_reverse[k] = GradReverseLayer(v)
 
         for k, cell_prop in cell_properties.items():
             # the output size of the cell property prediction MLP will be 1 if the property is continuous;
             # if it is discrete, then it will be the length of the possible values
             n_targets = 1 if not cell_prop["discrete"] else len(cell_prop["values"])
-            """
-            self.cell_mlp[k] = nn.Linear(latent_dim, n_targets, bias=True)
-            """
-            self.cell_mlp[k] = nn.Sequential(
-                nn.Linear(latent_dim, 2 * latent_dim),
-                nn.GELU(),
-                nn.Linear(2 * latent_dim, n_targets),
-            )
+            if use_hidden_layer:
+                print("Cell decoder hidden layer set to TRUE")
+                self.cell_mlp[k] = nn.Sequential(
+                    nn.Linear(latent_dim, 2 * latent_dim),
+                    nn.GELU(),
+                    nn.Linear(2 * latent_dim, n_targets),
+                )
+            else:
+                print("Cell decoder hidden layer set to FALSE")
+                self.cell_mlp[k] = nn.Linear(latent_dim, n_targets, bias=True)
 
 
     def forward(self, latent: torch.Tensor):
@@ -262,8 +312,8 @@ class CellDecoder(nn.Module):
         # Predict cell properties
         output = {}
         for n, (k, cell_prop) in enumerate(self.cell_properties.items()):
-            if k in self.grad_reverse_list:
-                x = self.grad_reverse(latent)
+            if k in self.grad_reverse_dict.keys():
+                x = self.grad_reverse[k](latent)
             else:
                 x = latent.detach() if cell_prop["stop_grad"] else latent
 
@@ -299,7 +349,6 @@ class DecoderSCVI(nn.Module):
         super().__init__()
         self.px_decoder = FCLayers(
             n_in=n_input,
-            n_out=n_hidden,
             n_layers=n_layers,
             n_hidden=n_hidden,
             dropout_rate=dropout_rate,
