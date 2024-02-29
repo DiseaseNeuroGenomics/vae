@@ -1,9 +1,11 @@
-
+from typing import Optional
 import pickle
+import copy
 import pandas as pd
 import numpy as np
 import anndata as ad
 import scipy.stats as stats
+import pingouin
 import matplotlib.pyplot as plt
 
 
@@ -28,68 +30,83 @@ def classification_score(x_pred, x_real):
 class ModelResults:
 
     def __init__(
-            self,
-            base_path: str = "/home/masse/work/vae/src/lightning_logs",
-            data_fn: str = "/home/masse/work/data/mssm_rush/data.dat",
-            meta_fn: str = "/home/masse/work/data/mssm_rush/metadata_slim.pkl",
-            gene_pathway_fn: str = "gene_pathways.pkl",
-            curated_pathways_fn: str = "ad_related_go_bp_pathways_1220.csv",
-            latent_dim: int = 32,
-            process_subclasses: bool = False,
+        self,
+        data_fn: str = "/home/masse/work/data/mssm_rush/data.dat",
+        meta_fn: str = "/home/masse/work/data/mssm_rush/metadata_slim.pkl",
+        #gene_pathway_fn: str = "go_bp_terms_max150_top100.pkl",
+        gene_pathway_fn: str = "go_bp_terms_10_150_top125.pkl",
+        important_genes_fn: str = "significant_genes_0229.pkl",
+        latent_dim: int = 32,
+        gene_count_prior: Optional[float] = None,
+        process_subclasses: bool = False,
+        n_bins: int = 20,
+        include_analysis_only: bool = True,
     ):
 
-        self.base_path = base_path
         self.data_fn = data_fn
         self.meta = pickle.load(open(meta_fn, "rb"))
         self.gene_pathways = pickle.load(open(gene_pathway_fn, "rb"))
-        self.curated_pathways = pd.read_csv(curated_pathways_fn)
+        self.important_genes = pickle.load(open(important_genes_fn, "rb"))
         self.convert_apoe()
         self.process_subclasses = process_subclasses
         #self.obs_list = ["Dementia",  "BRAAK_AD"]
-        self.obs_list = ["Dementia", "CERAD", "BRAAK_AD", "Dementia_graded"]
+        self.obs_list = ["BRAAK_AD",  "Dementia", ]
         self.n_genes = len(self.meta["var"]["gene_name"])
         self.gene_names = self.meta["var"]["gene_name"]
         self.latent_dim = latent_dim
-        self.extra_obs = [
-            "barcode", "Dementia", "MCI", "Sex", "apoe", "Age", "r03_r04", "ethnicity",
-            "ApoE_gt", "Brain_bank", "SCZ", "SubID", "subclass", "PMI", "Vascular", "ALS",
-            "include_analysis",
+        self.n_bins = n_bins
+        self.gene_count_prior = gene_count_prior
+        self.include_analysis_only = include_analysis_only
+
+        self.extra_obs = []
+        self.obs_from_metadata = [
+            "subclass", "Dementia_graded", "SubID", "include_analysis", "apoe", "Sex", "Age", "other_disorder",
+            "Brain_bank", "CERAD", "prs_scaled_AD_Bellenguez", "prs_scaled_alzKunkle", "European",
         ]
-        self.extra_obs = [
-            "Sex", "apoe", "Age",
-            "ApoE_gt", "Brain_bank",
-            "include_analysis",
+
+        self.donor_stats = [
+            "Sex", "Age", "apoe", "other_disorder", "Brain_bank", "BRAAK_AD", "Dementia", "Dementia_graded", "CERAD",
+            "pred_BRAAK_AD", "pred_Dementia", "prs_scaled_AD_Bellenguez", "prs_scaled_alzKunkle", "European",
         ]
+
+        gene_names = self.meta["var"]["gene_name"]
+        self.gene_mask = np.ones((len(gene_names),))
         """
-        self.extra_obs = [
-            "Dementia", "MCI", "Sex", "apoe",
-            "ApoE_gt", "Brain_bank", "SCZ", "SubID", "subclass", "PMI", "Vascular", "ALS",
-        ]
+        for n, name in enumerate(gene_names):
+            if name[:2] == "RP":
+                self.gene_mask[n] = 0.0
         """
 
-        self.get_gene_idx()
 
-    def create_data(self, model_versions, subclass=None):
+    def create_data(self, model_fns, subclass=None, model_average=False):
 
+        """
         if subclass is None:
-            index, cell_class, cell_subclasses = self.get_cell_index(model_versions)
+            index, cell_class, cell_subclasses = self.get_cell_index(model_fns)
             print(f"Subclasses present: {cell_subclasses}")
             print(cell_subclasses)
             assert len(cell_class) == 1, "Multiple cell classes detected!"
+        """
+        if model_average:
+            adata = self.create_base_anndata_repeats(model_fns, subclass=subclass)
+        else:
+            adata = self.create_base_anndata(model_fns, subclass=subclass)
+
+        adata = self.add_unstructured_data(adata)
+
+        # adata = self.combine_preds_and_actual(adata)
+        adata = self.add_prediction_indices(adata)
+
+        #adata = self.add_gene_scores(adata)
+        #adata = self.add_donor_stats(adata)
+        adata = self.add_donor_gene_correlations(adata)
+        
+        #adata = self.add_pathway_means_correlations(adata)
+        #adata = self.add_go_bp_pathway_scores(adata)
+
+        #adata = self.add_pathway_donor_means(adata)
 
 
-        adata = self.create_base_anndata(model_versions, subclass=subclass)
-
-
-        #adata = self.add_gene_scores_subject(adata)
-        #adata = self.add_gene_scores_pxr(adata, model_versions)
-        adata = self.add_gene_scores(adata)
-        #adata = self.dementia_time_course(adata)
-        #adata = self.add_gene_scores_dual(adata)
-        # adata = self.bootstrap_dementia(adata)
-        #adata = self.add_braak_gene_scores(adata)
-
-        adata = self.add_pathway_means_correlations(adata)
 
         return adata
 
@@ -120,15 +137,40 @@ class ModelResults:
 
         return np.sum(prob * w, axis=1)
 
+    def add_obs_from_metadata(self, adata):
+
+        for k in self.obs_from_metadata:
+            x = []
+            for n in adata.obs["cell_idx"]:
+                x.append(self.meta["obs"][k][n])
+            adata.obs[k] = x
+
+        return adata
+
+    def combine_preds_and_actual(self, adata, alpha=0.1):
+
+        for k in self.obs_list:
+            if k == "Dementia":
+                adata.obs[f"pred_{k}"] = (1-alpha) * adata.obs[f"pred_{k}"] + alpha * adata.obs["Dementia_graded"]
+            else:
+                adata.obs[f"pred_{k}"] = (1-alpha) * adata.obs[f"pred_{k}"] + alpha * adata.obs[k]
+
+        return adata
+
     def create_single_anndata(self, z):
 
-        latent = np.concatenate(z["latent"], axis=0)
-        latent = np.reshape(latent, (-1, self.latent_dim))
+        n = z["Dementia"].shape[0]
+        #latent = np.vstack(z["latent"])
+        latent = np.zeros((n, self.latent_dim), dtype=np.uint8)
         mask = np.reshape(z["cell_mask"], (-1, z["cell_mask"].shape[-1]))
 
         a = ad.AnnData(latent)
         for m, k in enumerate(self.obs_list):
-            a.obs[k] = z[k]
+            try:
+                a.obs[k] = z[k]
+            except:
+                print(f"{k} not found. Skipping.")
+                continue
             idx = np.where(mask[:, m] == 0)[0]
             a.obs[k][idx] = np.nan
             if z[f"pred_{k}"].ndim == 2:
@@ -146,39 +188,72 @@ class ModelResults:
                 idx = np.where(a.obs[k] < -99)[0]
                 a.obs[k][idx] = np.nan
 
+        a = self.add_obs_from_metadata(a)
 
         # Only include samples with include_analysis=True
-        # a = a[a.obs["include_analysis"] > 0]
+        if self.include_analysis_only:
+            a = a[a.obs["include_analysis"] > 0]
 
         return a
 
-    def create_base_anndata(self, model_versions, subclass=None):
+    def concat_arrays(self, fns):
 
-        for n, v in enumerate(model_versions):
-            fn = f"{self.base_path}/version_{v}/test_results.pkl"
+        for n, fn in enumerate(fns):
             z = pickle.load(open(fn, "rb"))
 
-            """
-            for ep in [16, 17, 18, 19]:
-                fn = f"{self.base_path}/version_{v}/test_results_ep{ep}.pkl"
-                z1 = pickle.load(open(fn, "rb"))
+            if n == 0:
+                x = copy.deepcopy(z)
+            else:
                 for k in self.obs_list:
-                    z[f"pred_{k}"] += z1[f"pred_{k}"]
-                    #z[f"{k}"] += z1[f"{k}"]
-            for k in self.obs_list:
-                z[f"pred_{k}"] /= 5.0
-            
-            
-            for k in self.obs_list:
-                z[f"pred_{k}"] /= 6.0
-                if k == "BRAAK_AD":
-                    v = np.array(z[f"{k}"])
-                    v[np.isnan(v)] = 0.0
-                    v[v<-9] = 0.0
-                    z[f"pred_{k}"] = 0.75 * z[f"pred_{k}"] + 0.25 *v
-            """
+                    x[k] = np.concatenate((x[k], z[k]), axis=0)
+                    x[f"pred_{k}"] = np.concatenate((x[f"pred_{k}"], z[f"pred_{k}"]), axis=0)
+                for k in self.extra_obs + ["cell_idx"]:
+                    x[k] = np.concatenate((x[k], z[k]), axis=0)
 
 
+
+        return x
+
+    def create_base_anndata_repeats(self, model_fns, subclass=None):
+
+        x = []
+        n_models = len(model_fns)
+        for fns in model_fns:
+            x0 = self.concat_arrays(fns)
+            idx = np.argsort(x0["cell_idx"])
+            for k in self.obs_list:
+                x0[k] = x0[k][idx]
+                x0[f"pred_{k}"] = x0[f"pred_{k}"][idx]
+            for k in self.extra_obs + ["cell_idx"]:
+                x0[k] = x0[k][idx]
+
+            x.append(x0)
+
+        x_new = copy.deepcopy(x0)
+        for k in self.obs_list:
+            x_new[k] = 0
+            x_new[f"pred_{k}"] = 0
+            for n in range(n_models):
+                x_new[k] += x[n][k] / n_models
+                x_new[f"pred_{k}"] += x[n][f"pred_{k}"] / n_models
+
+        for k in x_new.keys():
+            try:
+                print(k, x_new[k].shape)
+            except:
+                continue
+
+        adata = self.create_single_anndata(x_new)
+
+        if subclass is not None:
+            adata = adata[adata.obs.subclass == subclass]
+
+        return adata
+
+    def create_base_anndata(self, model_fns, subclass=None):
+
+        for n, fn in enumerate(model_fns):
+            z = pickle.load(open(fn, "rb"))
             a = self.create_single_anndata(z)
             a.obs["split_num"] = n
             if n == 0:
@@ -191,19 +266,17 @@ class ModelResults:
 
         return adata
 
-    def get_cell_index(self, model_versions):
+    def get_cell_index(self, model_fns):
 
         cell_idx = []
         cell_class = []
         cell_subclass = []
 
-        for n, v in enumerate(model_versions):
-            fn = f"{self.base_path}/version_{v}/test_results.pkl"
+        for n, fn in enumerate(model_fns):
             z = pickle.load(open(fn, "rb"))
             cell_idx += z["cell_idx"].tolist()
             cell_class += self.meta["obs"]["class"][z["cell_idx"]].tolist()
             cell_subclass += self.meta["obs"]["subclass"][z["cell_idx"]].tolist()
-            print(n, v, np.unique(self.meta["obs"]["Brain_bank"][z["cell_idx"]]))
 
         # assuming cell class is the same
         index = {cell_class[0]: cell_idx}
@@ -401,44 +474,49 @@ class ModelResults:
 
         return self.add_gene_scores(adata0)
 
-    def add_gene_scores_dual(self, adata, n_bins=10):
+    def add_prediction_indices(self, adata):
 
-        counts = np.zeros((n_bins, n_bins), dtype=np.float32)
-        scores = np.zeros((self.n_genes, n_bins, n_bins), dtype=np.float32)
+        for k in self.obs_list:
+            preds = np.array(adata.obs[f"pred_{k}"].values)
+            idx_sort = np.argsort(preds)
+            idx = np.array([np.where(n == idx_sort)[0][0] for n in range(len(preds))])
+            adata.obs[f"pred_idx_{k}"] = np.int64(idx * self.n_bins / len(adata))
 
-        for n, i in enumerate(adata.obs["cell_idx"]):
+        """
+        idx_braak = np.argsort(np.argsort(adata.obs[f"pred_BRAAK_AD"].values))
+        idx_dementia = np.argsort(np.argsort(adata.obs[f"pred_Dementia"].values))
+        N = len(idx_braak) // 5
 
-            data = np.memmap(
-                self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
-            ).astype(np.float32)
+        good = (adata.obs[f"BRAAK_AD"].values > -99) * (adata.obs[f"Dementia"].values > -99)
+        good *= ~np.isnan(np.array(adata.obs[f"BRAAK_AD"].values)) * ~np.isnan(np.array(adata.obs[f"Dementia"].values))
 
-            v0 = adata.obs[f"pred_Dementia"][n]
-            v1 = adata.obs[f"pred_BRAAK_AD"][n]
+        y0 = np.array(adata.obs[f"pred_BRAAK_AD"].values)
+        y1 = np.array(adata.obs[f"pred_Dementia"].values)
+        y0 -= np.mean(y0)
+        y0 /= np.std(y0)
+        y1 -= np.mean(y1)
+        y1 /= np.std(y1)
 
-            if np.isnan(v0) or np.isnan(v1):
-                continue
-            else:
-                bin0 = np.argmin((v0 - adata.uns[f"percentiles_Dementia"]) ** 2)
-                bin1 = np.argmin((v1 - adata.uns[f"percentiles_BRAAK_AD"]) ** 2)
-                counts[bin0, bin1] += 1
-                scores[:, bin0, bin1] += self.normalize_data(data)
+        adata.uns["idx_resilience"] = np.where(good * (y0 - y1 > 0.5))[0]
+        adata.uns["idx_susceptible"] = np.where(good * (y1 - y0 > 0.5))[0]
 
-        adata.uns["scores_Dm_BRAAK" ] = scores / counts[None, :, :]
+        print("AAAAAAAAAAAA")
+        print(len(adata.uns["idx_resilience"]))
+        print(len(adata.uns["idx_susceptible"]))
+        print(np.nanmean(adata.obs[f"BRAAK_AD"][adata.uns["idx_resilience"]]))
+        print(np.nanmean(adata.obs[f"BRAAK_AD"][adata.uns["idx_susceptible"]]))
+        print(np.nanmean(adata.obs[f"Dementia"][adata.uns["idx_resilience"]]))
+        print(np.nanmean(adata.obs[f"Dementia"][adata.uns["idx_susceptible"]]))
+
+        print("ACCURACY")
+        print(explained_var(np.array(adata.obs[f"pred_BRAAK_AD"].values)[good], np.array(adata.obs[f"BRAAK_AD"].values)[good]))
+        print(classification_score(np.array(adata.obs[f"pred_Dementia"].values)[good], np.array(adata.obs[f"Dementia"].values)[good]))
+        1/0
+        """
 
         return adata
 
-
-    def add_gene_scores(self, adata, n_bins=100):
-
-        k = "BRAAK_CERAD"
-        self.obs_list += [k]
-        adata.obs[f"pred_{k}"] = (
-            adata.obs["pred_BRAAK_AD"] / np.std(adata.obs["pred_BRAAK_AD"]) + adata.obs["pred_CERAD"] / np.std(adata.obs["pred_CERAD"])
-        )
-
-        percentiles = {}
-        for k in self.obs_list:
-            percentiles[k] = np.percentile(adata.obs[f"pred_{k}"], np.arange(0.5, 100.5, 1.0))
+    def add_gene_scores(self, adata):
 
         conds = [None,  {"Dementia": 0}, {"Dementia": 1}, {"Sex": "Male"}, {"Sex": "Female"}, {"apoe": 0}, {"apoe": 1}, {"apoe": 2}]
         score_names = ["", "_Dm0", "_Dm1", "_Male", "_Female", "_apoe0", "_apoe1", "_apoe2"]
@@ -451,10 +529,12 @@ class ModelResults:
                 for k, v in cond.items():
                     a = adata[adata.obs[k] == v]
 
-            counts = {k: np.zeros(n_bins, dtype=np.float32) for k in self.obs_list}
-            scores = {k: np.zeros((self.n_genes, n_bins), dtype=np.float32) for k in self.obs_list}
-            scores_sqr = {k: np.zeros((self.n_genes, n_bins), dtype=np.float32) for k in self.obs_list}
-            scores_std = {k: np.zeros((self.n_genes, n_bins), dtype=np.float32) for k in self.obs_list}
+            print("Condition", cond, "adata size", len(a))
+
+            counts = {k: np.zeros(self.n_bins, dtype=np.float32) for k in self.obs_list}
+            scores = {k: np.zeros((self.n_genes, self.n_bins), dtype=np.float32) for k in self.obs_list}
+            scores_sqr = {k: np.zeros((self.n_genes, self.n_bins), dtype=np.float32) for k in self.obs_list}
+            scores_std = {k: np.zeros((self.n_genes, self.n_bins), dtype=np.float32) for k in self.obs_list}
 
             print(f"Adding gene values. Name: {score_name}")
 
@@ -464,15 +544,13 @@ class ModelResults:
                     self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
                 ).astype(np.float32)
 
+                data = self.normalize_data(data)
+
                 for j, k in enumerate(self.obs_list):
-                    v = a.obs[f"pred_{k}"][n]
-                    if np.isnan(v):
-                        continue
-                    else:
-                        bin_idx = np.argmin((v - percentiles[k]) ** 2)
-                        counts[k][bin_idx] += 1
-                        scores[k][:, bin_idx] += self.normalize_data(data)
-                        scores_sqr[k][:, bin_idx] += self.normalize_data(data)**2
+                    bin_idx = a.obs[f"pred_idx_{k}"][n]
+                    counts[k][bin_idx] += 1
+                    scores[k][:, bin_idx] += data
+                    scores_sqr[k][:, bin_idx] += data**2
 
             for k in scores.keys():
                 scores[k] /= counts[k][None, :]
@@ -481,83 +559,659 @@ class ModelResults:
             adata.uns["scores" + score_name] = scores
             adata.uns["scores_std" + score_name] = scores_std
 
-            for k in self.obs_list:
-                adata.uns[f"percentiles_{k}"] = percentiles[k]
+        return adata
 
-        self.obs_list = self.obs_list[:-1]
+    def add_unstructured_data(self, adata):
+
+        adata.uns["go_bp_pathways"] = []
+        adata.uns["go_bp_ids"] = []
+        adata.uns["donors"] = []
+        for k in self.obs_list:
+            adata.uns[k] = []
+
+        for k, v in self.gene_pathways.items():
+            adata.uns["go_bp_pathways"].append(v["pathway"])
+            adata.uns["go_bp_ids"].append(k)
+
+        for subid in np.unique(adata.obs["SubID"]):
+            adata.uns["donors"].append(subid)
+            idx = np.where(np.array(adata.obs["SubID"].values) == subid)[0][0]
+            for k in self.obs_list:
+                adata.uns[k].append(adata.obs[k].values[idx])
 
         return adata
 
-    def get_gene_idx(self):
+    def add_donor_stats(self, adata):
 
-        self.gene_idx = {}
-        self.pathway_names = []
-        for go_id, path_name in zip(self.curated_pathways.go_id.values, self.curated_pathways.pathway.values):
-            genes_in_go_path = self.gene_pathways[go_id]
-            self.pathway_names.append(path_name)
-            self.gene_idx[go_id] = []
-            for g in genes_in_go_path:
-                idx = np.where(self.gene_names == g)[0]
-                if len(idx) > 0:
-                    self.gene_idx[go_id].append(idx[0])
-            self.gene_idx[go_id] = np.stack(self.gene_idx[go_id])
-
-        print("GENE iDX")
-        c = 0
-        for k, v in self.gene_idx.items():
-            print(k, v)
-            c += 1
-            if c > 3:
-                break
+        n_donors = len(adata.uns["donors"])
+        n_pathways = len(self.gene_pathways)
+        adata.uns[f"donor_gene_means"] = np.zeros((n_donors, self.n_genes), dtype=np.float32)
+        #adata.uns[f"donor_latent_means"] = np.zeros((n_donors, self.latent_dim), dtype=np.float32)
+        adata.uns[f"donor_cell_count"] = np.zeros((n_donors,), dtype=np.float32)
+        adata.uns[f"donor_pathway_means"] = np.zeros((n_donors, n_pathways), dtype=np.float32)
 
 
-    def add_pathway_means_correlations(self, adata, n_bins=100, gene_threshold=0.1):
+        # setting prior for pathway scores
+        mean_gene_vals = np.mean(adata.uns[f"scores"]["BRAAK_AD"], axis=1)
+        mask_genes = self.gene_mask
+        # add a prior term
+        if self.gene_count_prior is not None:
+            mean_gene_vals += self.gene_count_prior
+
+        # add a prior term
+        if self.gene_count_prior is not None:
+            mean_gene_vals += self.gene_count_prior
+
+        for k in self.donor_stats:
+            adata.uns[f"donor_{k}"] = np.zeros((n_donors,), dtype=np.float32)
+
+        for m, subid in enumerate(adata.uns["donors"]):
+            a = adata[adata.obs["SubID"] == subid]
+            count = 1e-6
+            go_scores = {}
+
+            for n, i in enumerate(a.obs["cell_idx"]):
+                data = np.memmap(
+                    self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
+                ).astype(np.float32)
+
+                data = self.normalize_data(data)
+                adata.uns[f"donor_gene_means"][m, :] += data
+
+                for go_id in self.gene_pathways.keys():
+                    go_idx = self.gene_pathways[go_id]["gene_idx"]
+                    if self.gene_count_prior is not None:
+                        gene_exp = np.sum(
+                            mask_genes[go_idx] * data[go_idx] / mean_gene_vals[go_idx]
+                        )
+                    else:
+                        gene_exp = np.sum(
+                            mask_genes[go_idx] * np.log1p(data[go_idx])
+                        )
+                    if not go_id in go_scores.keys():
+                        go_scores[go_id] = [gene_exp]
+                    else:
+                        go_scores[go_id].append(gene_exp)
+
+                for k in self.donor_stats:
+                    if "pred_" in k:
+                        adata.uns[f"donor_{k}"][m] += a.obs[f"{k}"][n]
+                    elif "Sex" in k:
+                        adata.uns[f"donor_{k}"][m] = float(a.obs[f"{k}"][n]=="Male")
+                    elif "Brain_bank" in k:
+                        adata.uns[f"donor_{k}"][m] = float(a.obs[f"{k}"][n]=="MSSM")
+                    else:
+                        adata.uns[f"donor_{k}"][m] = a.obs[f"{k}"][n]
+
+                count += 1
+
+            #adata.uns[f"donor_latent_means"][m, :] = np.mean(a.X, axis=0)
+            for n, go_id in enumerate(self.gene_pathways.keys()):
+                adata.uns[f"donor_pathway_means"][m, n] = np.mean(go_scores[go_id])
+
+            adata.uns[f"donor_gene_means"][m, :] /= count
+            adata.uns[f"donor_cell_count"][m] = count
+            for k in self.donor_stats:
+                if "pred_" in k:
+                    adata.uns[f"donor_{k}"][m] /= count
+
+        return adata
+
+    def add_donor_gene_correlations(self, adata):
+
+        gene_idx = self.important_genes["gene_idx"]
+        gene_names = self.important_genes["gene_names"]
+        adata.uns["gene_corr_names"] = gene_names
+
+        n_donors = len(adata.uns["donors"])
+        n_genes = len(gene_idx)
+        adata.uns[f"donor_gene_corr"] = np.zeros((n_donors, n_genes, n_genes), dtype=np.float32)
+        adata.uns[f"donor_gene_corr_counts"] = np.zeros((n_donors), dtype=np.float32)
+
+        for m, subid in enumerate(adata.uns["donors"]):
+            print(m, len(adata.uns["donors"]), subid)
+            a = adata[adata.obs["SubID"] == subid]
+            gene_counts = []
+
+            for n, i in enumerate(a.obs["cell_idx"]):
+                data = np.memmap(
+                    self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
+                ).astype(np.float32)
+
+                data = self.normalize_data(data)
+                gene_counts.append(data[gene_idx])
+
+            gene_counts = np.stack(gene_counts, axis=0)
+            adata.uns[f"donor_gene_corr_counts"][m] = gene_counts.shape[0]
+
+            for i in range(n_genes):
+                for j in range(i+1, n_genes):
+                    r, _ = stats.pearsonr(gene_counts[:, i], gene_counts[:, j])
+                    adata.uns[f"donor_gene_corr"][m, i, j] = r
+                    adata.uns[f"donor_gene_corr"][m, j, i] = r
+
+        return adata
+
+
+
+    def add_pathway_donor_means(self, adata, min_cells=10):
+
+        n_pathways = len(self.gene_pathways)
+        n_donors = len(adata.uns["donors"])
+        max_corr_donors = 100
+        count = 0
+        adata.uns[f"pathway_donor_means"] = np.zeros((n_donors, n_pathways), dtype=np.float32)
+        #adata.uns[f"pathway_donor_corr"] = np.zeros((max_corr_donors, n_pathways, n_pathways), dtype=np.float32)
+
+        k = "BRAAK_AD"
+
+        mean_gene_vals = np.mean(adata.uns[f"scores"][k], axis=1)
+        # we will mask out any genes with low expression
+        mask_genes = np.ones_like(mean_gene_vals)
+        mask_genes = self.gene_mask
+        print("XXX MEAN GENE VALS", mean_gene_vals.shape)
+        # mask_genes[mean_gene_vals < gene_threshold] = 0.0
+
+        # add a prior term
+        if self.gene_count_prior is not None:
+            mean_gene_vals += self.gene_count_prior
+
+        for m, subid in enumerate(adata.uns["donors"]):
+            print(m, len(adata.uns["donors"]), subid)
+            a = adata[adata.obs["SubID"] == subid]
+            go_scores = {}
+
+            for n, i in enumerate(a.obs["cell_idx"]):
+                data = np.memmap(
+                    self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
+                ).astype(np.float32)
+
+                data = self.normalize_data(data)
+
+                for go_id in self.gene_pathways.keys():
+                    go_idx = self.gene_pathways[go_id]["gene_idx"]
+
+                    if self.gene_count_prior is not None:
+                        gene_exp = np.sum(
+                            mask_genes[go_idx] * data[go_idx] / mean_gene_vals[go_idx]
+                        )
+                    else:
+                        gene_exp = np.sum(
+                            mask_genes[go_idx] * np.log1p(data[go_idx])
+                        )
+
+                    if not go_id in go_scores.keys():
+                        go_scores[go_id] = [gene_exp]
+                    else:
+                        go_scores[go_id].append(gene_exp)
+
+            if len(go_scores[go_id]) >= min_cells:
+                for n, go_id in enumerate(self.gene_pathways.keys()):
+                    adata.uns[f"pathway_donor_means"][m, n] = np.mean(go_scores[go_id])
+                    """
+                    if count < max_corr_donors:
+                        for n1, go_id1 in enumerate(self.gene_pathways.keys()):
+                            if n1 <= n:
+                                continue
+                            r, _ = stats.pearsonr(go_scores[go_id], go_scores[go_id1])
+                            adata.uns[f"pathway_donor_corr"][count, n, n1] = r
+                            adata.uns[f"pathway_donor_corr"][count, n1, n] = r
+                    """
+                count += 1
+
+            else:
+                adata.uns[f"pathway_donor_means"][m, n] = np.nan
+                #adata.uns[f"pathway_donor_corr"][m, n, :] = np.nan
+                #adata.uns[f"pathway_donor_corr"][m, :, n] = np.nan
+
+        return adata
+
+    def add_go_bp_pathway_resilience_scores(self, adata, n_bins=20):
 
         for k in ["BRAAK_AD", "Dementia"]:
 
-            v = np.reshape(np.array(adata.obs[f"pred_{k}"]), (-1, 1))
-            pct = np.reshape(np.array(adata.uns[f"percentiles_{k}"]), (1, -1))
-            n_pathways = len(self.curated_pathways)
+            n_pathways = len(self.gene_pathways)
 
             mean_gene_vals = np.mean(adata.uns[f"scores"][k], axis=1)
             # we will mask out any genes with low expression
             mask_genes = np.ones_like(mean_gene_vals)
-            mask_genes[mean_gene_vals < gene_threshold] = 0.0
+
+
+            # add a prior term
+            if self.gene_count_prior is not None:
+                mean_gene_vals += self.gene_count_prior
 
             print("MEAN GENE VALS", mean_gene_vals.shape)
 
-            adata.uns[f"pathway_mean_{k}"] = np.zeros((n_pathways, n_bins), dtype = np.float32)
-            adata.uns[f"pathway_corr_{k}"] = np.zeros((n_pathways, n_pathways, n_bins), dtype=np.float32)
-            adata.uns["pathway_names"] = self.pathway_names
-
-            d = np.abs(v - pct)
-            bin_idx = np.argmin(d, axis = 1)
+            adata.uns[f"pathway_mean_{k}"] = np.zeros((n_pathways, n_bins), dtype=np.float32)
+            adata.uns[f"pathway_subid_mean_{k}"] = np.zeros((n_pathways, n_bins), dtype=np.float32)
+            adata.uns[f"pathway_mean_resilience_{k}"] = np.zeros((n_pathways, n_bins, 2), dtype = np.float32)
+            #adata.uns[f"pathway_corr_{k}"] = np.zeros((n_pathways, n_pathways, n_bins), dtype=np.float32)
+            adata.uns[f"pathway_pval_{k}"] = np.ones((n_pathways, n_bins), dtype=np.float32)
+            adata.uns[f"pathway_subid_pval_{k}"] = np.ones((n_pathways, n_bins), dtype=np.float32)
+            adata.uns[f"pathway_ustat_{k}"] = np.ones((n_pathways, n_bins), dtype=np.float32)
+            adata.uns[f"pathway_subid_ustat_{k}"] = np.ones((n_pathways, n_bins), dtype=np.float32)
+            adata.uns[f"pathway_resilience_pval_{k}"] = np.ones((n_pathways, n_bins), dtype=np.float32)
+            adata.uns[f"pathway_resilience_subid_pval_{k}"] = np.ones((n_pathways, n_bins), dtype=np.float32)
+            adata.uns[f"pathway_resilience_ustat_{k}"] = np.ones((n_pathways, n_bins), dtype=np.float32)
+            adata.uns[f"pathway_resilience_subid_ustat_{k}"] = np.ones((n_pathways, n_bins), dtype=np.float32)
+            #adata.uns[f"pathway_tt_pval_{k}"] = np.ones((n_pathways, n_bins), dtype=np.float32)
 
             for b in range(n_bins):
-                idx = np.array(adata.obs["cell_idx"])[bin_idx == b]
-                go_scores = []
+                a = adata[adata.obs[f"pred_idx_{k}"] == b]
+                print("Size of bin", b, len(a))
 
-                for _, i in enumerate(idx):
+                pred_scores = []
+                go_scores_subid = {}
+                go_scores = {}
+
+                for n, i in enumerate(a.obs["cell_idx"]):
+                    data = np.memmap(
+                        self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
+                    ).astype(np.float32)
+
+                    subid = a.obs["SubID"].values[n]
+                    try:
+                        dementia = int(a.obs["Dementia"].values[n])
+                    except:
+                        dementia = -100
+
+                    if not dementia in [0, 1]:
+                        dementia = -100
+
+
+                    if not dementia in go_scores_subid.keys():
+                        go_scores_subid[dementia] = {}
+                    if not dementia in go_scores.keys():
+                        go_scores[dementia] = {}
+
+                    data = self.normalize_data(data)
+                    pred_scores.append(a.obs[f"pred_{k}"].values[n])
+
+                    for go_id in self.gene_pathways.keys():
+                        go_idx = self.gene_pathways[go_id]["gene_idx"]
+
+                        if self.gene_count_prior is not None:
+                            gene_exp = np.sum(
+                                mask_genes[go_idx] * data[go_idx] / mean_gene_vals[go_idx]
+                            )
+                        else:
+                            gene_exp = np.sum(
+                                mask_genes[go_idx] * np.log1p(data[go_idx])
+                            )
+
+                        if not go_id in go_scores[dementia].keys():
+                            go_scores[dementia][go_id] = [gene_exp]
+                        else:
+                            go_scores[dementia][go_id].append(gene_exp)
+
+                        if not go_id in go_scores_subid[dementia].keys():
+                            go_scores_subid[dementia][go_id] = {subid: [gene_exp]}
+                        else:
+                            if subid in go_scores_subid[dementia][go_id].keys():
+                                go_scores_subid[dementia][go_id][subid].append(gene_exp)
+                            else:
+                                go_scores_subid[dementia][go_id][subid] = [gene_exp]
+
+                print(f"BIN {b} mean pred score {np.mean(pred_scores)}")
+
+                # average across subject IDs
+                subject_averaged_bin_scores = {0: {}, 1: {}}
+                for dementia in [0, 1]:
+                    for go_id in self.gene_pathways.keys():
+                        subject_averaged_bin_scores[dementia][go_id] = []
+                        for subid in go_scores_subid[dementia][go_id].keys():
+                            subject_averaged_bin_scores[dementia][go_id].append(np.mean(go_scores_subid[dementia][go_id][subid]))
+
+                if b == 0:
+                    first_bin_subject = {}
+                    first_bin = {}
+                    for go_id in self.gene_pathways.keys():
+                        first_bin_subject[go_id] = (
+                                subject_averaged_bin_scores[0][go_id] +
+                                subject_averaged_bin_scores[1][go_id] +
+                                subject_averaged_bin_scores[-100][go_id]
+                        )
+                        first_bin[go_id] = go_scores[0][go_id] + go_scores[1][go_id] + go_scores[-100][go_id]
+
+                for n, go_id in enumerate(self.gene_pathways.keys()):
+                    current_bin = go_scores[0][go_id] + go_scores[1][go_id] + go_scores[-100][go_id]
+                    current_bin_subid = (
+                            subject_averaged_bin_scores[0][go_id] +
+                            subject_averaged_bin_scores[1][go_id] +
+                            subject_averaged_bin_scores[-100][go_id]
+                    )
+                    adata.uns[f"pathway_mean_{k}"][n, b] = np.mean(current_bin)
+                    adata.uns[f"pathway_subid_mean_{k}"][n, b] = np.mean(current_bin_subid)
+                    if b > 0:
+                        u, pval = stats.mannwhitneyu(first_bin[go_id], current_bin)
+                        adata.uns[f"pathway_pval_{k}"][n, b] = pval
+                        adata.uns[f"pathway_ustat_{k}"][n, b] = u / (len(first_bin[go_id]) * len(current_bin))
+
+                        #u, pval = stats.mannwhitneyu(first_bin_subject[go_id], current_bin_subid)
+                        #adata.uns[f"pathway_subid_pval_{k}"][n, b] = pval
+                        #adata.uns[f"pathway_subid_ustat_{k}"][n, b] = u / (len(first_bin_subject[go_id]) * len(current_bin_subid))
+
+
+
+
+                if k == "BRAAK_AD":
+                    for n, go_id in enumerate(self.gene_pathways.keys()):
+                        u, pval = stats.mannwhitneyu(
+                            subject_averaged_bin_scores[0][go_id], subject_averaged_bin_scores[1][go_id]
+                        )
+                        #adata.uns[f"pathway_resilience_subid_pval_{k}"][n, b] = pval
+                        #adata.uns[f"pathway_resilience_subid_ustat_{k}"][n, b] = u / (
+                        #        len(subject_averaged_bin_scores[0][go_id]) * len(subject_averaged_bin_scores[1][go_id])
+                        #)
+
+                        u, pval = stats.mannwhitneyu(go_scores[0][go_id], go_scores[1][go_id])
+                        adata.uns[f"pathway_resilience_pval_{k}"][n, b] = pval
+                        adata.uns[f"pathway_resilience_ustat_{k}"][n, b] = u / (
+                            len(go_scores[0][go_id]) * len(go_scores[1][go_id])
+                        )
+
+                    for n, go_id in enumerate(self.gene_pathways.keys()):
+                        for d in [0, 1]:
+                            adata.uns[f"pathway_mean_resilience_{k}"][n, b, d] = np.mean(go_scores[d][go_id])
+
+        return adata
+
+    def add_go_bp_pathway_scores(self, adata):
+
+        n_pathways = len(self.gene_pathways)
+
+        adata.uns[f"pathway_pval_resilience"] = np.ones((n_pathways, self.n_bins), dtype=np.float32)
+        adata.uns[f"pathway_ustat_resilience"] = np.ones((n_pathways, self.n_bins), dtype=np.float32)
+
+        for k in ["BRAAK_AD", "Dementia", ]:
+
+            mean_gene_vals = np.mean(adata.uns[f"scores"][k], axis=1)
+            # we will mask out any genes with low expression
+            # mask_genes = np.ones_like(mean_gene_vals)
+            mask_genes = self.gene_mask
+            print("ADD GO BP Masking", np.mean(mask_genes))
+
+            # add a prior term
+            if self.gene_count_prior is not None:
+                mean_gene_vals += self.gene_count_prior
+
+            print("MEAN GENE VALS", mean_gene_vals.shape)
+
+            adata.uns[f"pathway_mean_{k}"] = np.zeros((n_pathways, self.n_bins), dtype=np.float32)
+            adata.uns[f"pathway_pval_{k}"] = np.ones((n_pathways, self.n_bins), dtype=np.float32)
+            adata.uns[f"pathway_ustat_{k}"] = np.ones((n_pathways, self.n_bins), dtype=np.float32)
+
+
+            for b in range(self.n_bins):
+                a = adata[adata.obs[f"pred_idx_{k}"] == b]
+                print("Size of bin", b, len(a))
+
+                pred_scores = []
+                dementia = []
+                go_scores = {}
+
+                for n, i in enumerate(a.obs["cell_idx"]):
                     data = np.memmap(
                         self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
                     ).astype(np.float32)
 
                     data = self.normalize_data(data)
+                    pred_scores.append(a.obs[f"pred_{k}"].values[n])
+                    dementia.append(a.obs[f"Dementia_graded"].values[n])
 
-                    go_scores_cell = []
-                    for go_id, go_idx in self.gene_idx.items():
-                        v = mask_genes[go_idx] * data[go_idx] / mean_gene_vals[go_idx]
-                        go_scores_cell.append(np.mean(v))
-                    go_scores.append(np.stack(go_scores_cell, axis=0))
+                    for go_id in self.gene_pathways.keys():
+                        go_idx = self.gene_pathways[go_id]["gene_idx"]
 
-                go_scores = np.stack(go_scores, axis=0)
+                        if self.gene_count_prior is not None:
+                            gene_exp = np.sum(
+                                mask_genes[go_idx] * data[go_idx] / mean_gene_vals[go_idx]
+                            )
+                        else:
+                            gene_exp = np.sum(
+                                mask_genes[go_idx] * np.log1p(data[go_idx])
+                            )
 
-                for n0 in range(n_pathways):
-                    adata.uns[f"pathway_mean_{k}"][n0, b] = np.mean(go_scores[:, n0])
-                    for n1 in range(n_pathways):
-                        adata.uns[f"pathway_corr_{k}"][n0, n1, b], _ = stats.pearsonr(go_scores[:, n0], go_scores[:, n1])
+                        if not go_id in go_scores.keys():
+                            go_scores[go_id] = [gene_exp]
+                        else:
+                            go_scores[go_id].append(gene_exp)
+
+                print(f"BIN {b} mean pred score {np.mean(pred_scores)}")
+
+                if b == 0:
+                    first_bin = {}
+                    for go_id in self.gene_pathways.keys():
+                        first_bin[go_id] = copy.deepcopy(go_scores[go_id])
+                else:
+                    for n, go_id in enumerate(self.gene_pathways.keys()):
+                        adata.uns[f"pathway_mean_{k}"][n, b] = np.mean(go_scores[go_id])
+                        if b > 0:
+                            u, pval = stats.mannwhitneyu(first_bin[go_id], go_scores[go_id])
+                            adata.uns[f"pathway_pval_{k}"][n, b] = pval
+                            adata.uns[f"pathway_ustat_{k}"][n, b] = u / (len(first_bin[go_id]) * len(go_scores[go_id]))
+
+                if k == "BRAAK_AD":
+                    idx0 = np.array(dementia) == 0
+                    idx1 = np.array(dementia) == 1
+                    for n, go_id in enumerate(self.gene_pathways.keys()):
+                        u, pval = stats.mannwhitneyu(
+                            np.array(go_scores[go_id])[idx0],
+                            np.array(go_scores[go_id])[idx1])
+                        adata.uns[f"pathway_pval_resilience"][n, b] = pval
+                        adata.uns[f"pathway_ustat_resilience"][n, b] = u / (np.sum(idx0) * np.sum(idx1))
+
 
         return adata
 
 
+    def add_go_bp_pathway_scores_cell_level(self, adata):
 
+        k = "BRAAK_AD"
+        n_pathways = len(self.gene_pathways)
+        n_cells = adata.shape[0]
+
+        mean_gene_vals = np.mean(adata.uns[f"scores"][k], axis=1)
+        # we will mask out any genes with low expression
+        mask_genes = np.ones_like(mean_gene_vals)
+
+        # add a prior term
+        if self.gene_count_prior is not None:
+            mean_gene_vals += self.gene_count_prior
+
+        print("MEAN GENE VALS", mean_gene_vals.shape)
+
+        pathways = {}
+        for go_id in self.gene_pathways.keys():
+            pathways[go_id] = np.zeros((n_cells,), dtype=np.float32)
+
+
+        for n, i in enumerate(adata.obs["cell_idx"]):
+            data = np.memmap(
+                self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
+            ).astype(np.float32)
+
+            data = self.normalize_data(data)
+
+            for go_id in self.gene_pathways.keys():
+                go_idx = self.gene_pathways[go_id]["gene_idx"]
+
+                if self.gene_count_prior is not None:
+                    gene_exp = np.sum(
+                        mask_genes[go_idx] * data[go_idx] / mean_gene_vals[go_idx]
+                    )
+                else:
+                    gene_exp = np.sum(
+                        mask_genes[go_idx] * np.log1p(data[go_idx])
+                    )
+
+                pathways[go_id] = gene_exp
+
+        for go_id in self.gene_pathways.keys():
+            adata.obs[go_id] = pathways[go_id]
+
+
+        return adata
+
+
+    def add_pathway_means_correlations(self, adata):
+
+        print("Number of pathways", len(adata.uns["go_bp_pathways"]), len(self.gene_pathways))
+
+        k = "BRAAK_AD"
+
+        n_pathways = len(self.gene_pathways)
+        mean_gene_vals = np.mean(adata.uns[f"scores"][k], axis=1)
+        # we will mask out any genes with low expression
+        mask_genes = self.gene_mask
+        print("Mean of mask ", np.mean(mask_genes))
+        #mask_genes[mean_gene_vals < self.gene_threshold] = 0.0
+
+        # add a prior term
+        if self.gene_count_prior is not None:
+            mean_gene_vals += self.gene_count_prior
+
+        print("MEAN GENE VALS", mean_gene_vals.shape)
+
+        adata.uns[f"pathway_mean_{k}"] = np.zeros((n_pathways), dtype = np.float32)
+        adata.uns[f"pathway_corr_{k}"] = np.zeros((n_pathways, n_pathways), dtype=np.float32)
+
+        pred_scores = []
+        go_scores = {}
+
+        for n, i in enumerate(adata.obs["cell_idx"]):
+
+            data = np.memmap(
+                self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
+            ).astype(np.float32)
+            data = self.normalize_data(data)
+            pred_scores.append(adata.obs[f"pred_{k}"].values[n])
+
+            for go_id in self.gene_pathways.keys():
+                go_idx = self.gene_pathways[go_id]["gene_idx"]
+                if self.gene_count_prior is not None:
+                    gene_exp = np.sum(
+                        mask_genes[go_idx] * data[go_idx] / mean_gene_vals[go_idx]
+                    )
+                else:
+                    gene_exp = np.sum(
+                        mask_genes[go_idx] * np.log1p(data[go_idx])
+                    )
+                if not go_id in go_scores.keys():
+                    go_scores[go_id] = [gene_exp]
+                else:
+                    go_scores[go_id].append(gene_exp)
+
+        go_scores["model_pred"] = pred_scores
+
+        df = pd.DataFrame(go_scores)
+
+        for n0, go_id0 in enumerate(self.gene_pathways.keys()):
+            for n1, go_id1 in enumerate(self.gene_pathways.keys()):
+                if n1 <= n0:
+                    continue
+                s = pingouin.partial_corr(data=df, x=go_id0, y=go_id1, covar="model_pred")
+                adata.uns[f"pathway_corr_{k}"][n0, n1] = s["r"].values[0]
+                adata.uns[f"pathway_corr_{k}"][n1, n0] = s["r"].values[0]
+            """
+            for n0, go_id0 in enumerate(self.gene_pathways.keys()):
+                for n1, go_id1 in enumerate(self.gene_pathways.keys()):
+                    if n1 <= n0:
+                        continue
+                    r, _ = stats.pearsonr(go_scores[go_id0], go_scores[go_id1])
+                    adata.uns[f"pathway_corr_{k}"][n0, n1, b] = r
+                    adata.uns[f"pathway_corr_{k}"][n1, n0, b] = r
+            """
+
+
+        return adata
+
+
+bad_path_words = [
+    "female",
+    "bone",
+    "retina",
+    "ureteric",
+    "ear",
+    "skin",
+    "hair",
+    "cardiac",
+    "metanephros",
+    "outflow",
+    "sound",
+    "chondrocy",
+    "eye",
+    "vocalization",
+    "social",
+    "aorta",
+    "pancreas",
+    "digestive",
+    "cochlea",
+    "optic",
+    "megakaryocyte",
+    "embryo",
+    "ossifi",
+    "anterior/posterior",
+    "animal",
+    "cartilage",
+    "cocaine",
+    "sperm",
+    "blastocyst",
+    "fat ",
+    "mammary",
+    "substantia nigra",
+    "mesenchymal",
+    "estrous",
+    "hindbrain",
+    "forebrain",
+    "brain",
+    "locomotory",
+    "acrosome",
+    "ethanol",
+    "nicotine",
+    "cadmium",
+    "ovarian",
+    "melanocyte",
+    "lead",
+    "thyroid",
+    "dexamethasone",
+    "bacterium",
+    "motor",
+    "lung",
+    "oocyte",
+    "liver",
+    "odontogenesis",
+    "epidermis",
+    "endodermal",
+    "pulmonary",
+    "decidualization",
+    "response to heat",
+    "pituitary",
+    "tissue homeo",
+    "keratinocyte",
+    "keratinization",
+    "osteoblast",
+    "epidermal",
+    "sensory organ",
+    "layer formation",
+    "endocardial",
+    "organism development",
+    "embryo",
+    #"killing cells",
+    "protozoan",
+    "smell",
+    "tumor cell",
+    "hemopoiesis",
+    "sensory perception",
+    "genitalia",
+    "urine",
+    "xenobiotic",
+    "muscle",
+]
+
+
+def check_path_term(path, bad_path_words):
+    for p in bad_path_words:
+        if p in path:
+            return True
+    return False
