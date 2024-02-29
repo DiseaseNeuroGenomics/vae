@@ -138,9 +138,40 @@ class SingleCellDataset(Dataset):
             idx = np.where(cond)[0]
             self.group_idx[999] = idx.tolist()
 
-            #cond = (self.metadata["obs"]["Dementia"] > - 99) + (self.metadata["obs"]["BRAAK_AD"] > - 99)
-            #idx = np.where(cond)[0]
-            #self.group_idx[998] = idx.tolist()
+        elif self.group_balancing == "bd_augmented":
+            self.group_idx = {}
+            for b in range(7):
+                for d in range(2):
+                    cond = (self.metadata["obs"]["Dementia"] == d) * (
+                                self.metadata["obs"]["BRAAK_AD"] == b)
+                    idx = np.where(cond)[0]
+                    i = b * 10 + d
+                    self.group_idx[i] = idx.tolist()
+
+            full_idx = np.arange(len(self.metadata["obs"]["Dementia"]))
+            for i in range(14 * 3):
+                self.group_idx[900 + i] = full_idx.tolist()
+
+        elif self.group_balancing == "bd_special":
+            self.group_idx = {}
+            cond = (self.metadata["obs"]["Dementia"] == 1) * (
+                    self.metadata["obs"]["BRAAK_AD"] <= 2)
+            idx = np.where(cond)[0]
+            self.group_idx[0] = idx.tolist()
+
+            cond = (self.metadata["obs"]["Dementia"] == 0) * (
+                    self.metadata["obs"]["BRAAK_AD"] >= 4)
+            idx = np.where(cond)[0]
+            self.group_idx[1] = idx.tolist()
+
+            cond = (self.metadata["obs"]["Dementia"] >= 0) * (
+                    self.metadata["obs"]["BRAAK_AD"] >= 0)
+            idx = np.where(cond)[0]
+            self.group_idx[2] = idx.tolist()
+            self.group_idx[3] = idx.tolist()
+            self.group_idx[4] = idx.tolist()
+            self.group_idx[5] = idx.tolist()
+            self.group_idx[6] = idx.tolist()
 
         elif self.group_balancing == "bd5":
             self.group_idx = {}
@@ -218,14 +249,15 @@ class SingleCellDataset(Dataset):
         cond = np.zeros(len(self.metadata["obs"]["class"]), dtype=np.uint8)
         cond[self.cell_idx] = 1
 
-        if not self.training:
-            # cond *= self.metadata["obs"]["include_analysis"] == 1
+        if self.training:
             cond *= self.metadata["obs"]["include_training"] == 1
+            #cond *= self.metadata["obs"]["include_analysis"] == 1
         else:
             cond *= self.metadata["obs"]["include_training"] == 1
-            # cond *= self.metadata["obs"]["include_analysis"] == 1
+            #cond *= self.metadata["obs"]["include_analysis"] == 1
 
-        # cond *= self.metadata["obs"]["Age"] >= 40
+
+
         """
         cond *= self.metadata["obs"]["ALS"] == 0
         cond *= self.metadata["obs"]["SCZ"] == 0
@@ -234,11 +266,17 @@ class SingleCellDataset(Dataset):
         cond *= self.metadata["obs"]["SCZ"] == 0
         cond *= self.metadata["obs"]["PD"] == 0
         """
-
 
         if restrictions is not None:
             for k, v in restrictions.items():
-                if isinstance(v, list):
+                if k == "positive_prs":
+                    cond *= self.metadata["obs"]["prs_scaled_AD_Bellenguez"] > 0
+                    print("RESTRICTION:", k)
+                elif k == "negative_prs":
+                    cond *= self.metadata["obs"]["prs_scaled_AD_Bellenguez"] > -99
+                    cond *= self.metadata["obs"]["prs_scaled_AD_Bellenguez"] < 0
+                    print("RESTRICTION:", k)
+                elif isinstance(v, list):
                     cond *= np.sum(np.stack([self.metadata["obs"][k] == v1 for v1 in v]), axis=0).astype(np.uint8)
                 else:
                     cond *= self.metadata["obs"][k] == v
@@ -262,13 +300,14 @@ class SingleCellDataset(Dataset):
 
         if self.protein_coding_only:
             cond = 1
+            #cond *= self.metadata["var"]['percent_cells'] <= 2.0
             cond *= self.metadata["var"]['percent_cells'] >= 0.0
             # cond *= self.metadata["var"]['mean_expression'] >= 0.0
             # cond *= self.metadata["var"]['mean_expression'] < 99999
             # cond *= ~self.metadata["var"]["ribosomal"]
             # cond *= ~self.metadata["var"]["mitochondrial"]
-            cond *= self.metadata["var"]['gene_chrom'] != "X"
-            cond *= self.metadata["var"]['gene_chrom'] != "Y"
+            #cond *= self.metadata["var"]['gene_chrom'] != "X"
+            #cond *= self.metadata["var"]['gene_chrom'] != "Y"
             # cond *= self.metadata["var"]['protein_coding']
 
             self.gene_idx = np.where(cond)[0]
@@ -276,6 +315,7 @@ class SingleCellDataset(Dataset):
             self.gene_idx = np.arange(self.n_genes_original)
 
         self.n_genes = len(self.gene_idx)
+        self.gene_names = self.metadata["var"]["gene_name"][self.gene_idx]  # needed for pathway networks
         print(f"Sub-sampling genes. Number of genes is now {self.n_genes}")
 
     def _get_batch_prop_vals(self):
