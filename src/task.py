@@ -112,6 +112,8 @@ class LitVAE(pl.LightningModule):
         self.results["latent"] = []
         self.results["cell_mask"] = []
         self.results["px_r"] = []
+        self.results["donor_px_r_sums"] = {}
+        self.results["donor_px_r_counts"] = {}
         self.results["cell_idx"] = []
 
     def _cell_properties_metrics(self):
@@ -197,7 +199,7 @@ class LitVAE(pl.LightningModule):
 
         recon_loss = self.get_reconstruction_loss(x, px_rate, px_r, px_dropout)
 
-        loss = recon_loss.mean() + self.kl_weight * (kl_l +  kl_z).mean()
+        loss = recon_loss.mean() + self.kl_weight * (kl_l + kl_z).mean()
 
         if training:
             self.log("recon_loss", recon_loss.mean(), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
@@ -232,7 +234,7 @@ class LitVAE(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
 
-        gene_vals, cell_targets, cell_mask, batch_labels, batch_mask, cell_idx, _ = batch
+        gene_vals, cell_targets, cell_mask, batch_labels, batch_mask, cell_idx, _, subject = batch
         qz_m, qz_v, z = self.network.z_encoder(gene_vals, batch_labels, batch_mask)
         ql_m, ql_v, library = self.network.l_encoder(gene_vals, batch_labels, batch_mask)
         px_scale, _, px_rate, px_dropout = self.network.decoder(self.dispersion, z, library, batch_labels, batch_mask)
@@ -259,10 +261,21 @@ class LitVAE(pl.LightningModule):
         self.results["cell_idx"].append(cell_idx.detach().cpu().numpy())
         if self.save_gene_vals:
             self.results["px_r"].append(px_rate.detach().cpu().numpy().astype(np.float32))
+            """
+            for n, s in enumerate(subject):
+                if not s in self.results["donor_px_r_sums"].keys():
+                    self.results["donor_px_r_sums"][s] = px_rate[n, :].detach().cpu().numpy().astype(np.float32))
+                    self.results["donor_px_r_counts"][s] = 1
+                else:
+                    self.results["donor_px_r_sums"][s] += px_rate[n, :].detach().cpu().numpy().astype(np.float32))
+                    self.results["donor_px_r_counts"][s] += 1
+            """
+
+
 
         if self.cell_properties is not None:
             cell_pred = self.network.cell_decoder(qz_m)
-            self.cell_scores(cell_pred, cell_targets, cell_mask, qz_m)
+            self.cell_scores(cell_pred, cell_targets, cell_mask, qz_m, subject)
 
         if self.batch_properties is not None:
             for n, k in enumerate(self.batch_properties.keys()):
@@ -290,7 +303,9 @@ class LitVAE(pl.LightningModule):
         for k in self.cell_properties.keys():
             if len(self.results[k]) > 0:
                 self.results[k] = np.concatenate(self.results[k], axis=0)
-                self.results["pred_" + k] = np.concatenate(self.results["pred_" + k], axis=0)
+                if k != "SubID":
+                    self.results["pred_" + k] = np.concatenate(self.results["pred_" + k], axis=0)
+
         if self.batch_properties is not None:
             for k in self.batch_properties.keys():
                 self.results[k] = np.concatenate(self.results[k], axis=0)
@@ -299,12 +314,29 @@ class LitVAE(pl.LightningModule):
         self.results["cell_mask"] = np.concatenate(self.results["cell_mask"], axis=0)
         self.results["cell_idx"] = np.concatenate(self.results["cell_idx"], axis=0)
 
+        # save px_r as means for each donor
+        if "SubID" in self.results.keys() and self.save_gene_vals:
+            self.results["donor_px_r"] = {}
+            for donor in np.unique(self.results["SubID"]):
+                idx = np.where(np.array(np.array(self.results["SubID"]) == donor))[0]
+                self.results["donor_px_r"][donor] = np.mean(self.results["px_r"][idx, :], axis=0)
+            # remove to save space
+            self.results["px_r"] = None
+        self.results["SubID"] = None
+
         if "Dementia" in self.cell_accuracy and "BRAAK_AD" in self.cell_explained_var:
             x0 = self.results["pred_Dementia"][:, 1]
             x1 = self.results["pred_BRAAK_AD"]
             idx = np.where((x0 > -9) * (x1 > -9))[0]
             r, p = stats.pearsonr(x0[idx], x1[idx])
             self.log("corr", r, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        elif "Dementia_graded" in self.cell_explained_var and "BRAAK_AD" in self.cell_explained_var:
+            x0 = self.results["pred_Dementia_graded"]
+            x1 = self.results["pred_BRAAK_AD"]
+            idx = np.where((x0 > -9) * (x1 > -9))[0]
+            r, p = stats.pearsonr(x0[idx], x1[idx])
+            self.log("corr_graded", r, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+
 
         v = self.trainer.logger.version
         if not self.source_code_copied:
@@ -313,7 +345,7 @@ class LitVAE(pl.LightningModule):
         fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results.pkl"
         pickle.dump(self.results, open(fn, "wb"))
 
-        if self.current_epoch == 2 or self.current_epoch == 4:
+        if self.current_epoch == 4 or self.current_epoch == 9:
             fn = f"{self.trainer.log_dir}/lightning_logs/version_{v}/test_results_ep{self.current_epoch+1}.pkl"
             pickle.dump(self.results, open(fn, "wb"))
 
@@ -329,7 +361,7 @@ class LitVAE(pl.LightningModule):
         self.results["px_r"] = []
         self.results["cell_idx"] = []
 
-    def cell_scores(self, cell_pred, cell_targets, cell_mask, latent_mean):
+    def cell_scores(self, cell_pred, cell_targets, cell_mask, latent_mean, subject):
 
         if self.subject_batch_size > 1:
             cell_mask = torch.reshape(cell_mask, (-1, self.subject_batch_size, cell_mask.size()[-1])).mean(dim=1)
@@ -348,12 +380,12 @@ class LitVAE(pl.LightningModule):
                     targets = cell_targets[:, n].to(torch.int64)
 
                 self.cell_accuracy[k].update(pred_idx[idx][None, :], targets[idx][None, :])
-                if k != "SubID": # to save space
+                if k != "SubID":
                     self.results[k].append(targets.detach().cpu().numpy())
                     self.results["pred_" + k].append(pred_prob)
             else:
 
-                pred = torch.squeeze(cell_pred[k])
+                pred = cell_pred[k][:, 0]
                 """
                 if len(idx) > 1:
                     pred = torch.squeeze(cell_pred[k])
@@ -365,7 +397,10 @@ class LitVAE(pl.LightningModule):
                     targets = targets[idx]
                     self.cell_explained_var[k].update(pred[idx], targets)
                 else:
-                    self.cell_explained_var[k].update(pred[idx], cell_targets[idx, n])
+                    try: # rare error
+                        self.cell_explained_var[k].update(pred[idx], cell_targets[idx, n])
+                    except:
+                        self.cell_explained_var[k].update(pred, cell_targets[idx, n])
 
                 self.results[k].append(cell_targets[:, n].detach().cpu().numpy())
                 self.results["pred_" + k].append(pred.detach().cpu().to(torch.float32).numpy())
@@ -373,6 +408,7 @@ class LitVAE(pl.LightningModule):
         if latent_mean is not None:
             self.results["latent"].append(latent_mean.detach().cpu().to(torch.float32).numpy())
         self.results["cell_mask"].append(cell_mask.detach().cpu().to(torch.float32).numpy())
+        self.results["SubID"].append(subject)
 
         for k, v in self.cell_accuracy.items():
             self.log(k, v, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -411,12 +447,6 @@ class LitVAE(pl.LightningModule):
             if self.use_gdro and k in self.gdro.keys():
                 self.gdro[k].update_weights()
 
-        """
-        v = torch.hstack((cell_pred["BRAAK_AD"][:, 0:1], cell_pred["Dementia"][:, 1:2]))
-        r = torch.corrcoef(torch.transpose(v, 1, 0))
-        cell_loss += 10000000.0 * r[0, 1]
-        """
-
 
         return cell_loss
 
@@ -424,7 +454,7 @@ class LitVAE(pl.LightningModule):
 
         self.train_step += 1
 
-        gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, _, group_idx = batch
+        gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, _, group_idx, _ = batch
 
         # qz_m is the mean of the latent, qz_v is the variance, and z is the sampled latent
         qz_m, qz_v, z = self.network.z_encoder(gene_vals, batch_labels, batch_mask)
@@ -578,10 +608,10 @@ class Pathways(LitVAE):
 
     def validation_step(self, batch, batch_idx):
 
-        gene_vals, cell_targets, cell_mask, batch_labels, batch_mask, cell_idx, _ = batch
+        gene_vals, cell_targets, cell_mask, batch_labels, batch_mask, cell_idx, _, subject = batch
         cell_pred = self.network(gene_vals, batch_labels, batch_mask)
         self.results["cell_idx"].append(cell_idx.detach().cpu().numpy())
-        self.cell_scores(cell_pred, cell_targets, cell_mask, None)
+        self.cell_scores(cell_pred, cell_targets, cell_mask, None, subject)
 
     def _cell_loss(
             self,
@@ -609,7 +639,7 @@ class Pathways(LitVAE):
 
         self.train_step += 1
 
-        gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, _, group_idx = batch
+        gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, _, group_idx, _ = batch
         cell_pred = self.network(gene_vals, batch_labels, batch_mask)
 
         cell_loss = 0.0
