@@ -298,16 +298,22 @@ class SingleCellDataset(Dataset):
 
     def _get_gene_index(self):
 
+        cond = [g not in ["MALAT1", "LINC00486"] for g in self.metadata["var"]['gene_name']]
+        cond *= self.metadata["var"]['percent_cells'] > 0.0
+        cond *= self.metadata["var"]['gene_chrom'] != "X"
+        cond *= self.metadata["var"]['gene_chrom'] != "Y"
+        self.gene_idx = np.where(cond)[0]
+
         if self.protein_coding_only:
-            cond = 1
+            #cond = 1
             #cond *= self.metadata["var"]['percent_cells'] <= 2.0
             cond *= self.metadata["var"]['percent_cells'] >= 0.0
             # cond *= self.metadata["var"]['mean_expression'] >= 0.0
             # cond *= self.metadata["var"]['mean_expression'] < 99999
             # cond *= ~self.metadata["var"]["ribosomal"]
             # cond *= ~self.metadata["var"]["mitochondrial"]
-            #cond *= self.metadata["var"]['gene_chrom'] != "X"
-            #cond *= self.metadata["var"]['gene_chrom'] != "Y"
+            cond *= self.metadata["var"]['gene_chrom'] != "X"
+            cond *= self.metadata["var"]['gene_chrom'] != "Y"
             # cond *= self.metadata["var"]['protein_coding']
 
             self.gene_idx = np.where(cond)[0]
@@ -391,9 +397,10 @@ class SingleCellDataset(Dataset):
                 self.mask[batch_idx],
                 self.batch_labels[batch_idx],
                 self.batch_mask[batch_idx],
+                self.subjects[batch_idx],
             )
         else:
-            return self.labels[batch_idx], self.mask[batch_idx], None, None
+            return self.labels[batch_idx], self.mask[batch_idx], None, None, self.subjects[batch_idx]
 
 
     def _get_gene_vals_batch(self, batch_idx: List[int]):
@@ -411,10 +418,9 @@ class SingleCellDataset(Dataset):
 
         # get input and target data, returned as numpy arrays
         gene_vals = self._get_gene_vals_batch(batch_idx)
-        cell_prop_vals, cell_mask, batch_labels, batch_mask = self._get_cell_prop_vals_batch(batch_idx)
+        cell_prop_vals, cell_mask, batch_labels, batch_mask, subject = self._get_cell_prop_vals_batch(batch_idx)
 
-
-        return gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask
+        return gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, subject
 
     @staticmethod
     def _sample_beta_distribution(size, concentration=0.25):
@@ -501,7 +507,7 @@ class SingleCellDataset(Dataset):
 
         self.count += 1
 
-        gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask = self._prepare_data(batch_idx)
+        gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, subject = self._prepare_data(batch_idx)
         cell_idx = self.cell_idx[batch_idx]
 
         if self.cutmix and self.training:
@@ -512,7 +518,7 @@ class SingleCellDataset(Dataset):
             # does not work with batch labels, cell_mask
             gene_vals, cell_prop_vals, cell_mask = self._mixup(gene_vals, cell_prop_vals, cell_mask)
 
-        return (gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, cell_idx, group_idx)
+        return (gene_vals, cell_prop_vals, cell_mask, batch_labels, batch_mask, cell_idx, group_idx, subject)
 
 
 class DataModule(pl.LightningDataModule):
@@ -616,21 +622,24 @@ class DataModule(pl.LightningDataModule):
                 if not cell_prop["discrete"]:
                     # for cell properties with continuous value, determine the mean/std for normalization
                     # remove nans, negative values, or anything else suspicious
+                    """
                     if k in ["CERAD", "BRAAK_AD", "BRAAK_AD5", "BRAAK_CERAD"]:
                         unique_list = np.unique(cell_vals)
-                        unique_list = unique_list[unique_list > -999]
+                        unique_list = unique_list[unique_list > -99]
                         self.cell_properties[k]["mean"] = np.mean(unique_list)
                         self.cell_properties[k]["std"] = np.std(unique_list)
                         print(f"Property: {k}, mean: {self.cell_properties[k]['mean']}, std: {self.cell_properties[k]['std']}")
                     else:
-                        idx = [n for n, cv in enumerate(cell_vals) if cv >= 0 and cv < max_cell_prop_val]
-                        self.cell_properties[k]["mean"] = np.mean(cell_vals[idx])
-                        self.cell_properties[k]["std"] = np.std(cell_vals[idx])
-                        print(f"Property: {k}, mean: {self.cell_properties[k]['mean']}, std: {self.cell_properties[k]['std']}")
+                    """
+                    idx = [n for n, cv in enumerate(cell_vals) if cv >= 0 and cv < max_cell_prop_val]
+                    self.cell_properties[k]["mean"] = np.mean(cell_vals[idx])
+                    self.cell_properties[k]["std"] = np.std(cell_vals[idx])
+                    print(f"Property: {k}, mean: {self.cell_properties[k]['mean']}, std: {self.cell_properties[k]['std']}")
 
                 elif cell_prop["discrete"] and cell_prop["values"] is None:
                     # for cell properties with discrete value, determine the possible values if none were supplied
                     # and find their distribution
+
                     unique_list, counts = np.unique(cell_vals, return_counts=True)
                     # remove nans, negative values, or anything else suspicious
                     idx = [
