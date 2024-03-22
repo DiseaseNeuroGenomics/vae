@@ -4,8 +4,10 @@ import copy
 import pandas as pd
 import numpy as np
 import anndata as ad
+import pegasus as pg
 import scipy.stats as stats
 import pingouin
+from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 
 
@@ -35,12 +37,13 @@ class ModelResults:
         meta_fn: str = "/home/masse/work/data/mssm_rush/metadata_slim.pkl",
         #gene_pathway_fn: str = "go_bp_terms_max150_top100.pkl",
         gene_pathway_fn: str = "go_bp_terms_10_150_top125.pkl",
-        important_genes_fn: str = "significant_genes_0229.pkl",
+        important_genes_fn: str = "significant_genes_0305.pkl",
         latent_dim: int = 32,
         gene_count_prior: Optional[float] = None,
         process_subclasses: bool = False,
         n_bins: int = 20,
         include_analysis_only: bool = True,
+        load_gene_count: bool = False,
     ):
 
         self.data_fn = data_fn
@@ -57,16 +60,20 @@ class ModelResults:
         self.n_bins = n_bins
         self.gene_count_prior = gene_count_prior
         self.include_analysis_only = include_analysis_only
+        self.load_gene_count = load_gene_count
 
         self.extra_obs = []
         self.obs_from_metadata = [
             "subclass", "Dementia_graded", "SubID", "include_analysis", "apoe", "Sex", "Age", "other_disorder",
-            "Brain_bank", "CERAD", "prs_scaled_AD_Bellenguez", "prs_scaled_alzKunkle", "European",
+            "Brain_bank", "CERAD", "prs_scaled_AD_Bellenguez", "prs_scaled_alzKunkle", "European", "ALS", "FTD",
+            "PD", "SCZ",  'Epilepsy', 'Tumor', "MDD", "r03_r04",
         ]
 
         self.donor_stats = [
             "Sex", "Age", "apoe", "other_disorder", "Brain_bank", "BRAAK_AD", "Dementia", "Dementia_graded", "CERAD",
-            "pred_BRAAK_AD", "pred_Dementia", "prs_scaled_AD_Bellenguez", "prs_scaled_alzKunkle", "European",
+            "pred_BRAAK_AD", "pred_Dementia", "prs_scaled_AD_Bellenguez", "prs_scaled_alzKunkle", "European", "SCZ",
+            "ALS", "FTD", "PD", 'Epilepsy', 'Tumor', "include_analysis",
+            "MDD", "r03_r04",
         ]
 
         gene_names = self.meta["var"]["gene_name"]
@@ -97,9 +104,9 @@ class ModelResults:
         # adata = self.combine_preds_and_actual(adata)
         adata = self.add_prediction_indices(adata)
 
-        #adata = self.add_gene_scores(adata)
-        #adata = self.add_donor_stats(adata)
-        adata = self.add_donor_gene_correlations(adata)
+        adata = self.add_gene_scores(adata)
+        adata = self.add_donor_stats(adata)
+        #adata = self.add_donor_gene_pca(adata)
         
         #adata = self.add_pathway_means_correlations(adata)
         #adata = self.add_go_bp_pathway_scores(adata)
@@ -114,7 +121,7 @@ class ModelResults:
     def normalize_data(x):
         # no normalization allows one to trest results as Poisson -> mean = variance -> supposedly better results
         x = np.float32(x)
-        x = 10_000 * x / np.sum(x)
+        # x = 10_000 * x / np.sum(x)
         # x = np.log1p(x)
         return x
 
@@ -159,7 +166,7 @@ class ModelResults:
 
     def create_single_anndata(self, z):
 
-        n = z["Dementia"].shape[0]
+        n = z["BRAAK_AD"].shape[0]
         #latent = np.vstack(z["latent"])
         latent = np.zeros((n, self.latent_dim), dtype=np.uint8)
         mask = np.reshape(z["cell_mask"], (-1, z["cell_mask"].shape[-1]))
@@ -189,6 +196,9 @@ class ModelResults:
                 a.obs[k][idx] = np.nan
 
         a = self.add_obs_from_metadata(a)
+
+        if "donor_px_r" in z.keys():
+            a.uns["donor_px_r"] = z["donor_px_r"]
 
         # Only include samples with include_analysis=True
         if self.include_analysis_only:
@@ -259,7 +269,12 @@ class ModelResults:
             if n == 0:
                 adata = a.copy()
             else:
+                uns = adata.uns
                 adata = ad.concat((adata, a), axis=0)
+                adata.uns = uns
+                if "donor_px_r" in a.uns.keys():
+                    for k in a.uns["donor_px_r"].keys():
+                        adata.uns["donor_px_r"][k] = a.uns["donor_px_r"][k]
 
         if subclass is not None:
             adata = adata[adata.obs.subclass == subclass]
@@ -657,7 +672,10 @@ class ModelResults:
 
         return adata
 
-    def add_donor_gene_correlations(self, adata):
+    def add_donor_gene_pca(self, adata):
+
+        n_components = 20
+        pca = PCA(n_components=n_components)
 
         gene_idx = self.important_genes["gene_idx"]
         gene_names = self.important_genes["gene_names"]
@@ -665,8 +683,12 @@ class ModelResults:
 
         n_donors = len(adata.uns["donors"])
         n_genes = len(gene_idx)
-        adata.uns[f"donor_gene_corr"] = np.zeros((n_donors, n_genes, n_genes), dtype=np.float32)
-        adata.uns[f"donor_gene_corr_counts"] = np.zeros((n_donors), dtype=np.float32)
+        adata.uns[f"donor_pca_explained_var"] = np.zeros((n_donors, n_components), dtype=np.float32)
+        adata.uns[f"donor_pca_explained_var_ratio"] = np.zeros((n_donors, n_components), dtype=np.float32)
+        adata.uns[f"donor_pca_components"] = np.zeros((n_donors, n_components, n_genes), dtype=np.float32)
+        adata.uns[f"donor_pca_var"] = np.zeros((n_donors, n_genes), dtype=np.float32)
+        adata.uns[f"donor_pca_noise_var"] = np.zeros((n_donors), dtype=np.float32)
+        adata.uns[f"donor_pca_counts"] = np.zeros(n_donors, dtype=np.float32)
 
         for m, subid in enumerate(adata.uns["donors"]):
             print(m, len(adata.uns["donors"]), subid)
@@ -682,13 +704,22 @@ class ModelResults:
                 gene_counts.append(data[gene_idx])
 
             gene_counts = np.stack(gene_counts, axis=0)
-            adata.uns[f"donor_gene_corr_counts"][m] = gene_counts.shape[0]
+            #gene_counts = np.log1p(gene_counts)
+            gene_counts -= np.mean(gene_counts, axis=0, keepdims=True)
+            gene_counts /= (0.1 + np.std(gene_counts, axis=0, keepdims=True))
+            adata.uns[f"donor_pca_counts"][m] = gene_counts.shape[0]
 
-            for i in range(n_genes):
-                for j in range(i+1, n_genes):
-                    r, _ = stats.pearsonr(gene_counts[:, i], gene_counts[:, j])
-                    adata.uns[f"donor_gene_corr"][m, i, j] = r
-                    adata.uns[f"donor_gene_corr"][m, j, i] = r
+            if gene_counts.shape[0] < 20:
+                continue
+
+            pca.fit(gene_counts)
+            adata.uns[f"donor_pca_explained_var"][m, :] = pca.explained_variance_
+            adata.uns[f"donor_pca_explained_var_ratio"][m, :] = pca.explained_variance_ratio_
+            adata.uns[f"donor_pca_components"][m, :, :] = pca.components_
+            #adata.uns[f"donor_pca_cov"][m, :, :] = pca.get_covariance()
+            adata.uns[f"donor_pca_var"][m, :] = np.var(gene_counts, axis=0)
+            adata.uns[f"donor_pca_noise_var"][m] = pca.noise_variance_
+
 
         return adata
 
@@ -1125,6 +1156,54 @@ class ModelResults:
 
 
         return adata
+
+
+class GeneSignature:
+
+    def __init__(
+            self,
+            gene_signatures,
+
+            data_fn: str = "/home/masse/work/data/mssm_rush/data.dat",
+            meta_fn: str = "/home/masse/work/data/mssm_rush/metadata_slim.pkl",
+    ):
+        self.gene_signatures = gene_signatures
+        meta = pickle.load(open(meta_fn, "rb"))
+        self.gene_names = meta["var"]["gene_name"]
+        self.n_genes = len(self.gene_names)
+        del meta
+        self.data_fn = data_fn
+
+        genes = []
+        for v in self.gene_signatures.values():
+            genes += v
+        self.genes = np.unique(genes)
+        self.gene_idx = []
+        for g in self.genes:
+            j = np.where(np.array(self.gene_names) == g)[0][0]
+            self.gene_idx.append(j)
+        self.gene_idx = np.array(self.gene_idx)
+
+    def create_adata(self, adata):
+
+        n_genes_signature = len(self.gene_idx)
+        n = adata.shape[0]
+        adata_new = ad.AnnData(np.zeros((n, n_genes_signature), dtype=np.float32))
+        adata_new.var["gene_name"] = list(self.genes)
+        adata_new.var.index = adata_new.var["gene_name"]
+        adata_new.obs = adata.obs.copy()
+        adata_new.uns = adata.uns.copy()
+        del adata
+
+        for n, i in enumerate(adata_new.obs["cell_idx"]):
+            data = np.memmap(
+                self.data_fn, dtype='uint8', mode='r', shape=(self.n_genes,), offset=i * self.n_genes,
+            ).astype(np.float32)
+            adata_new.X[n, :] = data[self.gene_idx]
+
+        return adata_new
+
+
 
 
 bad_path_words = [
