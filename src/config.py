@@ -17,12 +17,15 @@ cell_properties = {
     #"class": {"discrete": True, "values": ['Astro', 'EN', 'Endo', 'IN', 'Immune', 'Mural', 'OPC', 'Oligo'], "stop_grad": True},
     #"subclass": {"discrete": True, "values": None, "stop_grad": True},
     "Age": {"discrete": False, "values": [-1], "stop_grad": True},
+    "PMI": {"discrete": False, "values": [-1], "stop_grad": True},
     #"Vascular": {"discrete": True, "values": [0, 1], "stop_grad": False},
     #"FTD": {"discrete": True, "values": [0, 1], "stop_grad": False},
     #"PMI": {"discrete": False, "values": [-1],  "stop_grad": True},
-    #"SCZ": {"discrete": True, "values": [0, 1],  "stop_grad": False},
-    #"ALS": {"discrete": True, "values": [0, 1],  "stop_grad": False},
-    #"PD": {"discrete": True, "values": [0, 1],  "stop_grad": False},
+    "SCZ": {"discrete": True, "values": [0, 1],  "stop_grad": True},
+    #"ethnicity": {"discrete": True, "values": None,  "stop_grad": True},
+    #"prep": {"discrete": True, "values": None,  "stop_grad": True},
+    "ALS": {"discrete": True, "values": [0, 1],  "stop_grad": False},
+    "PD": {"discrete": True, "values": [0, 1],  "stop_grad": False},
     "other_disorder": {"discrete": True, "values": [0, 1],  "stop_grad": True},
     "SubID": {"discrete": True, "values": None,  "stop_grad": True},
     #"n_counts": {"discrete": False, "values": [-1],  "stop_grad": True},
@@ -50,34 +53,36 @@ dataset_cfg = {
 }
 
 model_cfg = {
-    "n_layers": 1,
-    "n_hidden": 128,
-    "n_hidden_decoder": 128,
+    "n_layers": 2,
+    "n_hidden": 512,
+    "n_hidden_decoder": 512,
     "n_hidden_library": 128,
-    "n_latent": 16,
-    "n_latent_cell_decoder": 16,
+    "n_latent": 32,
+    "n_latent_cell_decoder": 32,
     "dropout_rate": 0.5,
     "input_dropout_rate": 0.5,
-    "grad_reverse_dict": {"SubID": 0.25, "Brain_bank": 0.25,  "other_disorder": 0.25, "Age": 0.25},
+    "grad_reverse_dict": {
+        "SubID": 0.5, "Brain_bank": 0.2,  "other_disorder": 0.2, "Age": 0.2, "Sex": 0.2, "PMI": 0.2,  "SCZ": 0.0, "ALS": 0.0, "PD": 0.0,
+    },
     "cell_decoder_hidden_layer": False,
 }
 
 task_cfg = {
-    "learning_rate": 2e-4,
+    "learning_rate": 5e-4,
     "warmup_steps": 1000.0,
     "weight_decay": 0.0,
     "l1_lambda": 0.000,
-    "gene_loss_coeff": 2e-4,
+    "gene_loss_coeff": 5e-3,
     "balance_classes": False,
     "n_epochs_kl_warmup": None,
     "batch_properties": batch_properties,
-    "save_gene_vals": False,
+    "save_gene_vals": True,
     "use_gdro": False,
 }
 
 trainer_cfg = {
     "n_devices": 1,
-    "grad_clip_value": 0.25,
+    "grad_clip_value": 0.5,
     "accumulate_grad_batches": 1,
     "precision": "bf16-mixed",
 }
