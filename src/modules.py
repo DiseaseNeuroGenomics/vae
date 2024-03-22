@@ -232,6 +232,8 @@ class Encoder(nn.Module):
         dropout_rate: float = 0.1,
         input_dropout_rate: float = 0.0,
         distribution: str = "normal",
+        shared_variance: bool = True,
+
     ):
         super().__init__()
 
@@ -244,7 +246,7 @@ class Encoder(nn.Module):
             batch_properties=batch_properties,
         )
         self.mean_encoder = nn.Linear(n_hidden, n_output)
-        self.var_encoder = nn.Linear(n_hidden, n_output)
+        self.var_encoder = nn.Linear(n_hidden, 1) if shared_variance else nn.Linear(n_hidden, n_output)
         # self.bn = nn.BatchNorm1d(n_input, momentum=0.05, eps=10.0)
         self.ln = nn.LayerNorm(n_input, elementwise_affine=False)
 
